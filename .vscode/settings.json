@@ -66,6 +66,16 @@
         "text_encoding": "cpp",
         "thread": "cpp",
         "typeinfo": "cpp",
-        "variant": "cpp"
+        "variant": "cpp",
+        "list": "cpp",
+        "set": "cpp",
+        "source_location": "cpp",
+        "cinttypes": "cpp",
+        "complex": "cpp",
+        "fstream": "cpp",
+        "iostream": "cpp",
+        "shared_mutex": "cpp",
+        "stdfloat": "cpp",
+        "typeindex": "cpp"
     }
 }

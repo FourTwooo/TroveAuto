@@ -281,6 +281,9 @@ namespace Module
     static float maxY = 400, minY = -45;
     static std::pair<float, float> aimOffset = {1.25, 0.25};
 
+    // 短暂黑名单
+    std::vector<std::string> timeOutIds = {};
+
     // ===== 新增：扫图参数 & 状态 =====
     static uint32_t realisticScanRange = 300;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
     static std::unordered_set<std::string> switchIds = { // NEW: “开关ID”列表（仅作名称/关键词匹配）
@@ -413,7 +416,7 @@ namespace Module
 
     struct PrioritizedEntity;
     struct MoveCtx; // 前置声明
-    void KillEntitys(const Memory::DWORD &pid, std::vector<PrioritizedEntity> &entitys, Game &game, MoveCtx &ctx, uint32_t sleepTime, std::string tab, Game::World::Entity overEntity, std::vector<std::regex> noTargetRegexs);
+    void KillEntitys(const Memory::DWORD &pid, std::vector<PrioritizedEntity> &entitys, Game &game, MoveCtx &ctx, uint32_t sleepTime, std::string tab, Game::World::Entity overEntity, std::vector<std::string> targets, std::vector<std::string> noTargets);
 
 };
 
@@ -422,7 +425,6 @@ extern "C"
     DLL_EXPORT void UpdateConfig(const char *key, const char *value);
     DLL_EXPORT void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv = "", const bool waiting = false);
     DLL_EXPORT void FunctionOff(const Memory::DWORD pid, const char *funtion = nullptr);
-
     DLL_EXPORT void WhichTarget(const Memory::DWORD pid, char *result, const uint32_t size, const char *argv = "");
 }
 
@@ -589,7 +591,7 @@ namespace Module
         {
             bool dead = (game.data.player.data.health.UpdateAddress().UpdateData().data == 0);
             Module::isPlayerDead.store(dead);
-
+            LOGF("[自动复活] dead=%d", dead);
             if (dead)
             {
                 // TODO: 这里可补“模拟按键E”复活
@@ -744,11 +746,12 @@ namespace Module
 
     // 定义优先处理的宝箱类型列表（这些宝箱会被优先考虑）
     static const std::vector<std::string> priorityChests = {
-        "gameplay/chest_quest_rune_vault_01",     // 符文宝库宝箱
+        "gameplay/chest_quest_rune_vault_01",     // 5*宝箱
         "gameplay/chest_quest_standard_large",    // 标准大宝箱
         "gameplay/chest_quest_standard_small",    // 标准小宝箱
-        "gameplay/chest_quest_geode_5star_small", // 5*深渊宝箱
-        "gameplay/chest_quest_geode_5star_large"  // 5*最后宝箱
+        "gameplay/chest_quest_geode_5star_large", // 深渊大宝箱
+        "gameplay/chest_quest_geode_5star_small", // 深渊小宝箱
+        "chest_quest_recipe.*"                    // 配方宝箱
     };
 
     static const std::vector<std::string> ButtonStarts = {
@@ -762,13 +765,47 @@ namespace Module
         float ay,
         float az,
         const uint32_t &range,
-        const bool &targetBoss,                        // 是否以Boss级实体为目标
-        const bool &targetPlant,                       // 是否以植物类实体为目标
-        const bool &targetNormal,                      // 是否以普通实体为目标
-        const std::vector<std::regex> &targetRegexs,   // 目标名称白名单（正则表达式）
-        const std::vector<std::regex> &noTargetRegexs, // 目标名称黑名单（正则表达式）
+        const bool &targetBoss,             // 是否以Boss级实体为目标
+        const bool &targetPlant,            // 是否以植物类实体为目标
+        const bool &targetNormal,           // 是否以普通实体为目标
+        std::vector<std::string> targets,   // 目标名称白名单（正则表达式）
+        std::vector<std::string> noTargets, // 目标名称黑名单（正则表达式）
         uint32_t paramBossLevel)
     {
+
+        // auto b2s = [](bool v)
+        // { return v ? "true" : "false"; };
+        // auto joinQuoted = [](const std::vector<std::string> &v)
+        // {
+        //     std::string s;
+        //     s.reserve(64);
+        //     s += '[';
+        //     for (size_t i = 0; i < v.size(); ++i)
+        //     {
+        //         if (i)
+        //             s += ", ";
+        //         s += '\'';
+        //         s += v[i];
+        //         s += '\'';
+        //     }
+        //     s += ']';
+        //     return s;
+        // };
+
+        // LOGF("[GetEntitysWithPriority] ax=%.2f ay=%.2f az=%.2f range=%u boss=%s plant=%s normal=%s level=%u "
+        //      "targets=%s noTargets=%s",
+        //      ax, ay, az, range,
+        //      b2s(targetBoss), b2s(targetPlant), b2s(targetNormal),
+        //      paramBossLevel,
+        //      joinQuoted(targets).c_str(),
+        //      joinQuoted(noTargets).c_str());
+        noTargets.reserve(noTargets.size() + timeOutIds.size());                 // 先预留，避免多次扩容
+        noTargets.insert(noTargets.end(), timeOutIds.begin(), timeOutIds.end()); // 追加
+
+        // 使用辅助函数创建正则表达式向量
+        std::vector<std::regex> targetRegexs = createRegexVector(targets);
+        std::vector<std::regex> noTargetRegexs = createRegexVector(noTargets);
+
         std::vector<PrioritizedEntity> result;
 
         auto &entitys = game.data.world.UpdateAddress().UpdateData().data.entitys;
@@ -798,45 +835,52 @@ namespace Module
             auto name = entity.data.name.UpdateData(128).data;
 
             // 检查实体是否在黑名单中（使用正则表达式匹配）
-            size_t i = 0;
-            while (i < noTargetRegexs.size() && !std::regex_match(name, noTargetRegexs[i]))
-                i++;
-            // 如果匹配到黑名单中的任何一个模式，跳过这个实体
-            if (i < noTargetRegexs.size())
+            bool is_noTargetRegexs = false;
+            for (const auto &rx : noTargetRegexs)
+            {
+                if (std::regex_search(name, rx))
+                {
+                    is_noTargetRegexs = true;
+                    break;
+                } // 子串匹配更稳
+            }
+            if (is_noTargetRegexs)
                 continue;
 
             // 检查实体是否在白名单中（使用正则表达式匹配）
-            i = 0;
-            // 遍历白名单正则表达式，检查实体名称是否匹配任何一个
-            while (i < targetRegexs.size() && !std::regex_match(name, targetRegexs[i]))
-                i++;
-
-            // 如果匹配到白名单中的任何一个模式
-            if (i < targetRegexs.size())
+            bool is_targetRegexs = false;
+            for (const auto &rx : targetRegexs)
+            {
+                if (std::regex_search(name, rx))
+                {
+                    is_targetRegexs = true;
+                    break;
+                } // 子串匹配更稳
+            }
+            if (is_targetRegexs)
             {
                 priority += 800;
-            }
-
-            if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos && BlackListed(mx, mz))
-            {
-                continue;
-            }
-
-            for (const auto &chest : priorityChests)
-            {
-                // 如果实体名称包含优先宝箱的关键字
-                if (name.find(chest) != std::string::npos)
+                if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos && BlackListed(mx, mz))
                 {
-                    priority += 1000;
+                    continue;
                 }
-            }
 
-            for (const auto &start : ButtonStarts)
-            {
-                // 如果实体名称包含优先开关的关键字
-                if (name.find(start) != std::string::npos)
+                for (const auto &chest : priorityChests)
                 {
-                    priority += 100;
+                    // 如果实体名称包含优先宝箱的关键字
+                    if (name.find(chest) != std::string::npos)
+                    {
+                        priority += 1000;
+                    }
+                }
+
+                for (const auto &start : ButtonStarts)
+                {
+                    // 如果实体名称包含优先开关的关键字
+                    if (name.find(start) != std::string::npos)
+                    {
+                        priority += 100;
+                    }
                 }
             }
 
@@ -885,173 +929,131 @@ namespace Module
     };
 
     // inline void MoveEvent(Game &game, MoveCtx &ctx,
-    //                       float targetX, float targetY, float targetZ)
+    //                       float tx, float ty, float tz)
     // {
-    //     ctx.x = game.data.player.data.coord.data.x.UpdateAddress().UpdateData().data;
-    //     ctx.y = game.data.player.data.coord.data.y.UpdateAddress().UpdateData().data;
-    //     ctx.z = game.data.player.data.coord.data.z.UpdateAddress().UpdateData().data;
+    //     // 阻塞参数：每 tick 间隔=ctx.safeDelay（你外面已设置），最大阻塞时长=8s
+    //     const uint32_t dt = std::max<uint32_t>(1, ctx.safeDelay);
+    //     const uint32_t TIMEOUTMS = 60000;
+    //     const uint32_t MAXTICKS = std::max<uint32_t>(1, TIMEOUTMS / dt);
 
+    //     // 与老版一致的平滑速度（跨调用保留，如需按线程隔离可改 thread_local）
+    //     static float pvx = 0.f, pvy = 0.f, pvz = 0.f;
+    //     const float alpha = 0.35f;
+
+    //     // 进入前不清速，保持老版行为（如需清速，可在此三行置 0）
+    //     // game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
+    //     // game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
+    //     // game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
+
+    //     for (uint32_t t = 0; t < MAXTICKS; ++t)
+    //     {
+    //         // 当前位置（保持老版：仅 UpdateData）
+    //         float x = game.data.player.data.coord.data.x.UpdateData().data;
+    //         float y = game.data.player.data.coord.data.y.UpdateData().data;
+    //         float z = game.data.player.data.coord.data.z.UpdateData().data;
+
+    //         float dx = tx - x, dy = ty - y, dz = tz - z;
+    //         float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
+    //         if (!(dist > 1.0f) || std::isnan(dist))
+    //         {
+    //             // 到达或无效 → 清速后返回
+    //             game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
+    //             game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
+    //             game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
+    //             return;
+    //         }
+
+    //         // 老版速度：模长恒等于 ctx.speed（无任何限速/减速）
+    //         const float inv = ctx.speed / std::max(dist, 1e-3f);
+    //         const float dvx = dx * inv, dvy = dy * inv, dvz = dz * inv;
+
+    //         // 指数平滑（alpha=0.35）
+    //         pvx = pvx + alpha * (dvx - pvx);
+    //         pvy = pvy + alpha * (dvy - pvy);
+    //         pvz = pvz + alpha * (dvz - pvz);
+
+    //         // 写速度（写入前 UpdateAddress，保持你的写法）
+    //         game.data.player.data.coord.data.xVel.UpdateAddress() = pvx;
+    //         game.data.player.data.coord.data.yVel.UpdateAddress() = pvy;
+    //         game.data.player.data.coord.data.zVel.UpdateAddress() = pvz;
+
+    //         std::this_thread::sleep_for(std::chrono::milliseconds(dt));
+    //     }
+
+    //     // 超时：停速后返回（不会继续跑）
     //     game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
     //     game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
     //     game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-
-    //     ctx.dist = CalculateDistance(ctx.x, ctx.y, ctx.z, targetX, targetY, targetZ);
-    //     if (ctx.dist <= 1.0f || std::isnan(ctx.dist))
-    //         return;
-
-    //     if (ctx.step % (250 / ctx.safeDelay) == 0)
-    //         ctx.lastDist = ctx.dist;
-    //     ctx.step = (ctx.step + 1) % (1000 / ctx.safeDelay);
-
-    //     if (ctx.step % (500 / ctx.safeDelay) == 0 && Module::tpStep && std::fabs(ctx.lastDist - ctx.dist) < Module::tpStep)
-    //     {
-    //         Tp2Target(ctx.pid, targetX, targetY, targetZ, ctx.safeDelay,
-    //                   (std::fabs(ctx.lastDist - ctx.dist) < 1.0f) ? 10 : 1);
-    //     }
-    //     else
-    //     {
-    //         const float inv = ctx.speed / std::max(ctx.dist, 1e-3f);
-    //         game.data.player.data.coord.data.xVel.UpdateAddress() = (targetX - ctx.x) * inv;
-    //         game.data.player.data.coord.data.yVel.UpdateAddress() = (targetY - ctx.y) * inv;
-    //         game.data.player.data.coord.data.zVel.UpdateAddress() = (targetZ - ctx.z) * inv;
-    //     }
     // }
 
-    inline void MoveEvent(Game &game, MoveCtx &ctx,
-                          float tx, float ty, float tz)
+    bool MoveUntilReached(
+        Game &game,
+        float targetX, float targetY, float targetZ)
     {
-        // 阻塞参数：每 tick 间隔=ctx.safeDelay（你外面已设置），最大阻塞时长=8s
-        const uint32_t dt = std::max<uint32_t>(1, ctx.safeDelay);
-        const uint32_t TIMEOUTMS = 60000;
-        const uint32_t MAXTICKS = std::max<uint32_t>(1, TIMEOUTMS / dt);
+        game.UpdateAddress().data.player.UpdateAddress();
+        float stop_eps = 1.0f;
+        uint32_t timeout_ms = 60000;
+        float speed = 50.f; // 固定速度（与老版 MoveEvent 保持一致）
+        uint32_t delay_ms = 20;
+        auto t0 = std::chrono::steady_clock::now();
+        auto baseline_t = t0;
+        float baseline_d = std::numeric_limits<float>::infinity();
+        bool allow_tp = true;
 
-        // 与老版一致的平滑速度（跨调用保留，如需按线程隔离可改 thread_local）
-        static float pvx = 0.f, pvy = 0.f, pvz = 0.f;
-        const float alpha = 0.35f;
-
-        // 进入前不清速，保持老版行为（如需清速，可在此三行置 0）
-        // game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-        // game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-        // game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-
-        for (uint32_t t = 0; t < MAXTICKS; ++t)
+        for (;;)
         {
-            // 当前位置（保持老版：仅 UpdateData）
-            float x = game.data.player.data.coord.data.x.UpdateData().data;
-            float y = game.data.player.data.coord.data.y.UpdateData().data;
-            float z = game.data.player.data.coord.data.z.UpdateData().data;
+            // 刷新坐标
+            game.data.player.data.coord.UpdateAddress();
+            float cx = game.data.player.data.coord.data.x.UpdateAddress().UpdateData().data;
+            float cy = game.data.player.data.coord.data.y.UpdateAddress().UpdateData().data;
+            float cz = game.data.player.data.coord.data.z.UpdateAddress().UpdateData().data;
 
-            float dx = tx - x, dy = ty - y, dz = tz - z;
-            float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-            if (!(dist > 1.0f) || std::isnan(dist))
+            // 到达判定
+            float dist = CalculateDistance(cx, cy, cz, targetX, targetY, targetZ);
+            if (std::isnan(dist) || dist <= stop_eps)
             {
-                // 到达或无效 → 清速后返回
-                game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-                game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-                game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-                return;
+                game.data.player.data.coord.data.xVel.UpdateAddress() = 0;
+                game.data.player.data.coord.data.yVel.UpdateAddress() = 0;
+                game.data.player.data.coord.data.zVel.UpdateAddress() = 0;
+                return !std::isnan(dist); // NaN 视为失败
             }
 
-            // 老版速度：模长恒等于 ctx.speed（无任何限速/减速）
-            const float inv = ctx.speed / std::max(dist, 1e-3f);
-            const float dvx = dx * inv, dvy = dy * inv, dvz = dz * inv;
+            // 正常推进：写速度 = 单位方向 * speed
+            game.data.player.data.coord.data.xVel.UpdateAddress() = (targetX - cx) / dist * speed;
+            game.data.player.data.coord.data.yVel.UpdateAddress() = (targetY - cy) / dist * speed;
+            game.data.player.data.coord.data.zVel.UpdateAddress() = (targetZ - cz) / dist * speed;
 
-            // 指数平滑（alpha=0.35）
-            pvx = pvx + alpha * (dvx - pvx);
-            pvy = pvy + alpha * (dvy - pvy);
-            pvz = pvz + alpha * (dvz - pvz);
-
-            // 写速度（写入前 UpdateAddress，保持你的写法）
-            game.data.player.data.coord.data.xVel.UpdateAddress() = pvx;
-            game.data.player.data.coord.data.yVel.UpdateAddress() = pvy;
-            game.data.player.data.coord.data.zVel.UpdateAddress() = pvz;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(dt));
-        }
-
-        // 超时：停速后返回（不会继续跑）
-        game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-        game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-        game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-    }
-
-    // 阻塞到达/超时返回；返回 true=到达，false=超时
-    inline bool MoveEventBlocking(
-        Game &game, MoveCtx &ctx,
-        float targetX, float targetY, float targetZ,
-        uint32_t tick_ms,          // 每 tick 间隔（一般用 ctx.safeDelay）
-        float baseSpeed,           // 期望速度（单位=速度向量模长）
-        float stopDist = 1.0f,     // 到达阈值
-        uint32_t timeout = 5000,   // 超时上限（毫秒）
-        float slowRadius = 10.0f,  // 进入该半径内减速
-        float accelPerTick = 1.0f, // 每 tick 加速度（限斜率）
-        float speedCap = 12.0f     // 硬限速（防止回弹）
-    )
-    {
-        const uint32_t dt = std::max<uint32_t>(1, tick_ms);
-        const uint32_t maxTicks = std::max<uint32_t>(1, timeout / dt);
-
-        float vmag = 0.f; // 当前速度模长（做加速度限幅）
-        float lastSample = std::numeric_limits<float>::infinity();
-
-        for (uint32_t t = 0; t < maxTicks; ++t)
-        {
-            // 当前位置
-            ctx.x = game.data.player.data.coord.data.x.UpdateAddress().UpdateData().data;
-            ctx.y = game.data.player.data.coord.data.y.UpdateAddress().UpdateData().data;
-            ctx.z = game.data.player.data.coord.data.z.UpdateAddress().UpdateData().data;
-
-            // 距离
-            ctx.dist = CalculateDistance(ctx.x, ctx.y, ctx.z, targetX, targetY, targetZ);
-            if (std::isnan(ctx.dist))
-                break;
-
-            // 到达：清零速度并返回
-            if (ctx.dist <= stopDist)
+            // 卡住监测 + 小跳解卡（复用你原本窗口：10*delay/20*delay）
+            auto now = std::chrono::steady_clock::now();
+            auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - baseline_t).count();
+            if (dt >= (int)delay_ms * 20)
             {
-                game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-                game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-                game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-                return true;
+                baseline_t = now;
+                baseline_d = dist;
             }
-
-            // 兜底：每 ~250ms 采样一次进度，不动就 Tp 一下
-            if (t % std::max<uint32_t>(1, 250u / dt) == 0)
+            else if (dt >= (int)delay_ms * 10)
             {
-                if (Module::tpStep && std::isfinite(lastSample) && std::fabs(lastSample - ctx.dist) < Module::tpStep)
+                if (allow_tp && tpStep && std::abs(baseline_d - dist) < tpStep)
                 {
-                    Tp2Target(ctx.pid, targetX, targetY, targetZ, dt,
-                              (std::fabs(lastSample - ctx.dist) < 1.f) ? 10 : 1);
+                    uint32_t tries = (std::abs(baseline_d - dist) < 1.0f) ? 10u : 1u;
+                    Tp2Target(game.pid, targetX, targetY, targetZ, delay_ms, tries);
+                    // 重置基线，下一窗再评估
+                    baseline_t = std::chrono::steady_clock::now();
+                    baseline_d = std::numeric_limits<float>::infinity();
                 }
-                lastSample = ctx.dist;
             }
 
-            // 速度设计：限速 + 减速 + 加速度限幅
-            const float cap = std::max(0.f, speedCap);
-            const float vBase = std::min(std::max(0.f, baseSpeed), cap);
-            float factor = 1.0f;
-            if (ctx.dist < slowRadius)
+            // 超时保护
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count() >= timeout_ms)
             {
-                // 近目标减速（最低保留 20%）
-                factor = std::clamp(ctx.dist / slowRadius, 0.2f, 1.0f);
+                game.data.player.data.coord.data.xVel.UpdateAddress() = 0;
+                game.data.player.data.coord.data.yVel.UpdateAddress() = 0;
+                game.data.player.data.coord.data.zVel.UpdateAddress() = 0;
+                return false;
             }
-            const float vTarget = std::min(vBase * factor, cap);
-            vmag = std::min(vTarget, vmag + std::max(0.f, accelPerTick)); // 线性加速到目标
 
-            // 写速度向量（归一化方向向量 * vmag）
-            const float inv = vmag / std::max(ctx.dist, 1e-3f);
-            game.data.player.data.coord.data.xVel.UpdateAddress() = (targetX - ctx.x) * inv;
-            game.data.player.data.coord.data.yVel.UpdateAddress() = (targetY - ctx.y) * inv;
-            game.data.player.data.coord.data.zVel.UpdateAddress() = (targetZ - ctx.z) * inv;
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(dt));
+            std::this_thread::sleep_for(std::chrono::milliseconds(delay_ms));
         }
-
-        // 超时：停速后返回 false
-        game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-        game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-        game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-        return false;
     }
 
     void FollowTarget(
@@ -1067,13 +1069,9 @@ namespace Module
         // 扫图相关参数
         static std::unordered_set<std::string> visitedPoints;
         static bool hasGoal = false;
-        static float targetX = 0.f, targetZ = 0.f;
+        // static float targetX = 0.f, targetZ = 0.f;
 
         MoveCtx mv{.safeDelay = delay ? delay : 1, .speed = speed, .pid = pid};
-
-        // 使用辅助函数创建正则表达式向量
-        std::vector<std::regex> targetRegexs = createRegexVector(targets);
-        std::vector<std::regex> noTargetRegexs = createRegexVector(noTargets);
 
         // 创建Game对象，用于与游戏进程交互
         Game game(pid);
@@ -1086,11 +1084,49 @@ namespace Module
         float ax = game.data.player.data.coord.data.x.UpdateData().data;
         float ay = game.data.player.data.coord.data.y.UpdateData().data;
         float az = game.data.player.data.coord.data.z.UpdateData().data;
+        float x = 0, y = 0, z = 0, targetX = 0;
+        float targetY = 0, targetZ = 0, dist = 0, lastDist = 9999;
+        std::chrono::steady_clock::time_point findTime, moveTime;
+
+        auto MoveEvent = [&game, &x, &y, &z, &dist, &lastDist, &moveTime, &delay, &speed](
+                             const float &targetX, float targetY, const float &targetZ)
+        {
+            x = game.data.player.data.coord.data.x.UpdateData().data;
+            y = game.data.player.data.coord.data.y.UpdateData().data;
+            z = game.data.player.data.coord.data.z.UpdateData().data;
+            game.data.player.data.coord.data.xVel.UpdateAddress() = 0;
+            game.data.player.data.coord.data.yVel.UpdateAddress() = 0;
+            game.data.player.data.coord.data.zVel.UpdateAddress() = 0;
+            if ((dist = CalculateDistance(x, y, z, targetX, targetY, targetZ)) <= 1 || std::isnan(dist))
+                return;
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - moveTime)
+                    .count() >= delay * 20)
+            {
+                moveTime = std::chrono::steady_clock::now();
+                lastDist = dist;
+            }
+
+            if (std::chrono::duration_cast<std::chrono::milliseconds>(now - moveTime)
+                        .count() >= delay * 10 &&
+                tpStep && abs(lastDist - dist) < tpStep)
+                Tp2Target(game.pid, targetX, targetY, targetZ, delay, abs(lastDist - dist) < 1 ? 10 : 1);
+            else
+            {
+                game.data.player.data.coord.data.xVel.UpdateAddress() = (targetX - x) / dist * speed;
+                game.data.player.data.coord.data.yVel.UpdateAddress() = (targetY - y) / dist * speed;
+                game.data.player.data.coord.data.zVel.UpdateAddress() = (targetZ - z) / dist * speed;
+            }
+        };
+
         while (functionRunMap[{pid, "FollowTarget"}].load())
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
-            // DebugDumpPlayerCoordChain(game, pid);
-
+            // 更新游戏基址和玩家地址信息
+            game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+            ax = game.data.player.data.coord.data.x.UpdateData().data;
+            ay = game.data.player.data.coord.data.y.UpdateData().data;
+            az = game.data.player.data.coord.data.z.UpdateData().data;
             // 获取与自己距离最近的实体列表
             std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
                 game,
@@ -1099,8 +1135,8 @@ namespace Module
                 targetBoss,
                 false,
                 false,
-                targetRegexs,
-                noTargetRegexs,
+                targets,
+                noTargets,
                 bossLevel);
 
             if (entitys.empty())
@@ -1119,39 +1155,27 @@ namespace Module
                         hasGoal = true;
                         LOGF("[初始启动扫描无名单开始移动] => (%.0f, %.0f)", targetX, targetZ); // 只在这里打
                     }
+                    // MoveEvent(game, mv, targetX, ty, targetZ);
                     // 每帧朝格心推进：用“你已有的” MoveEvent
-                    float ty = std::clamp(game.data.player.data.coord.data.y.UpdateAddress().UpdateData().data, Module::minY, Module::maxY);
-                    ax = targetX;
-                    ay = ty;
-                    az = targetZ;
-                    // MoveEventBlocking(game, mv, targetX, ty, targetZ,
-                    //                   mv.safeDelay, /*baseSpeed=*/mv.speed,
-                    //                   /*stopDist=*/1.0f, /*timeout=*/120000,
-                    //                   /*slowRadius=*/10.0f, /*accelPerTick=*/1.0f, /*speedCap=*/12.0f);
-
-                    MoveEvent(game, mv, targetX, ty, targetZ); // ← 就用你已经有的那个 MoveEvent
+                    // float ty = std::clamp(game.data.player.data.coord.data.y.UpdateAddress().UpdateData().data, Module::minY, Module::maxY);
+                    // MoveEvent(game, mv, targetX, ty, targetZ);
+                    // MoveUntilReached(game, targetX, ty, targetZ);
+                    MoveEvent(targetX, targetY = std::clamp((std::max)(targetY, game.data.player.data.coord.data.y.UpdateData().data), minY, maxY), targetZ);
                     // 到达格心 → 再取下一格
                     if (Module::Arrived2D(game, targetX, targetZ, 1.0f))
                     {
                         targetX = game.data.player.data.coord.data.x.UpdateData().data;
                         targetZ = game.data.player.data.coord.data.z.UpdateData().data;
                         GetNextPoint(targetX, targetZ, visitedPoints);
-                        LOGF("[周边扫描无名单前往新格中心] => (%.0f,?,%.0f)", targetX, targetZ);
+                        LOGF("[周边扫描无名单前往新格中心] => (%.0f,%.0f,%.0f)", targetX, targetY, targetZ);
+                        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
                     }
-                }
-                else
-                {
-                    // 更新游戏基址和玩家地址信息
-                    game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
-                    ax = game.data.player.data.coord.data.x.UpdateData().data;
-                    ay = game.data.player.data.coord.data.y.UpdateData().data;
-                    az = game.data.player.data.coord.data.z.UpdateData().data;
                 }
             }
             else
             {
                 // 清理逻辑
-                KillEntitys(pid, entitys, game, mv, 2000, "", e, noTargetRegexs);
+                KillEntitys(pid, entitys, game, mv, 2000, "", e, targets, noTargets);
             }
         }
     }
@@ -1191,15 +1215,16 @@ namespace Module
         uint32_t sleepTime,
         std::string tab,
         Game::World::Entity overEntity,
-        std::vector<std::regex> noTargetRegexs)
+        std::vector<std::string> targets,
+        std::vector<std::string> noTargets)
     {
         static std::unordered_set<uintptr_t> printed;
 
         Game::World::Entity e(static_cast<Object<> &>(game));
         e.address = 0; // 标记为空
 
-        std::vector<std::regex> tr = {};
-        std::vector<std::regex> nr = noTargetRegexs;
+        std::vector<std::string> tr = {};
+        std::vector<std::string> nr = noTargets;
 
         // 遍历entitys并输出日志
         for (auto &pe : entitys)
@@ -1231,7 +1256,7 @@ namespace Module
                 if (overEntity.address != 0)
                 {
                     overEntity.UpdateAddress().UpdateData();
-                    if (overEntity.data.isDeath.UpdateAddress().UpdateData().data == 0)
+                    if (overEntity.data.isDeath.UpdateAddress().UpdateData().data == 0 || !EntityStillExists(game, overEntity))
                     {
                         // LOGF("祭坛已消失 退出多层方法嵌套");
                         return;
@@ -1242,8 +1267,28 @@ namespace Module
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
                 if (elapsed >= timeoutMs)
                 {
-                    LOGF("[超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs)",
-                         name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                    std::vector<std::regex> targetRegexs = createRegexVector(targets);
+                    // 检查实体是否在黑名单中（使用正则表达式匹配）
+                    bool is_targets = false;
+                    for (const auto &rx : targetRegexs)
+                    {
+                        if (std::regex_search(name, rx))
+                        {
+                            is_targets = true;
+                            break;
+                        } // 子串匹配更稳
+                    }
+                    if (is_targets)
+                    {
+                        LOGE("[超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [未拉入临时黑名单. 因为他存在目标名单中.]",
+                             name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                    }
+                    else
+                    {
+                        timeOutIds.emplace_back(name);
+                        LOGE("[超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [已拉入本次运行临时黑名单. 如需匹配请重启软件]",
+                             name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                    }
                     break;
                 }
                 entity.UpdateAddress().UpdateData();
@@ -1307,7 +1352,8 @@ namespace Module
                     auto chestStartTime = std::chrono::steady_clock::now();
                     while (BlackListed(ex, ez) == false)
                     {
-                        MoveEvent(game, ctx, ex, ey + 1.5f, ez);
+                        // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
+                        MoveUntilReached(game, ex, ey + 1.5f, ez);
                         game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
                         float ax = game.data.player.data.coord.data.x.UpdateData().data;
                         float ay = game.data.player.data.coord.data.y.UpdateData().data;
@@ -1338,12 +1384,28 @@ namespace Module
 
                 if (std::find(ButtonStarts.begin(), ButtonStarts.end(), name) != ButtonStarts.end())
                 {
-                    std::vector<std::regex> _targetRegexs = {};
-                    std::vector<std::regex> _noTargetRegexs = noTargetRegexs;
+                    std::vector<std::string> _targets = {};
+                    std::vector<std::string> _noTargets = noTargets;
                     if (name.find("quest_assault_trigger") != std::string::npos)
                     {
-                        _noTargetRegexs.emplace_back("quest_assault_trigger");
-                        _noTargetRegexs.emplace_back(".*portal_.*");
+                        // 先到达开关
+                        while (true)
+                        {
+                            game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                            float ax = game.data.player.data.coord.data.x.UpdateData().data;
+                            float ay = game.data.player.data.coord.data.y.UpdateData().data;
+                            float az = game.data.player.data.coord.data.z.UpdateData().data;
+                            float currentDist = CalculateDistance(ax, ay, az, ex, ey, ez);
+                            if (currentDist < 2.0f)
+                            {
+                                std::this_thread::sleep_for(std::chrono::milliseconds(1000));
+                                break;
+                            }
+                            // MoveEvent(game, ctx, ex, ey, ez);
+                            MoveUntilReached(game, ex, ey, ez);
+                        }
+                        _noTargets.emplace_back("quest_assault_trigger");
+                        _noTargets.emplace_back(".*portal_.*");
                         std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
                             game,
                             ex, ey, ez,
@@ -1351,33 +1413,74 @@ namespace Module
                             true,
                             false,
                             true,
-                            _targetRegexs,
-                            _noTargetRegexs,
+                            _targets,
+                            _noTargets,
                             2);
                         if (!entitys.empty())
                         {
-                            KillEntitys(pid, entitys, game, ctx, 1, std::string(tab + " [[祭坛]") + name + "]", entity, noTargetRegexs);
+                            KillEntitys(pid, entitys, game, ctx, 1, std::string(tab + " [[祭坛]") + name + "]", entity, targets, noTargets);
                         }
                     }
                     else if (name.find("quest_spawn_trigger_fivestar") != std::string::npos || name.find("quest_spawn_trigger_fivestar_depths") != std::string::npos)
                     {
-                        _targetRegexs.emplace_back("quest_assault_trigger");
+                        _targets.emplace_back("quest_assault_trigger");
+                        if (name.find("quest_spawn_trigger_fivestar_depths") != std::string::npos)
+                        {
+                            _targets.emplace_back("gameplay/chest_quest_rune_vault_01");
+                            _targets.emplace_back("gameplay/chest_quest_geode_5star_large");
+                            _targets.emplace_back("gameplay/chest_quest_geode_5star_small");
+                        }
+                        else if (name.find("quest_spawn_trigger_fivestar") != std::string::npos)
+                        {
+                            _targets.emplace_back("gameplay/chest_quest_standard_large");
+                            _targets.emplace_back("gameplay/chest_quest_standard_small");
+                        }
                         // MoveEventBlocking(game, ctx, ex, ey + 2.0f, ez,
                         //                   ctx.safeDelay, /*baseSpeed=*/ctx.speed,
                         //                   /*stopDist=*/1.0f, /*timeout=*/60000,
                         //                   /*slowRadius=*/8.0f, /*accelPerTick=*/0.8f, /*speedCap=*/10.0f);
-                        MoveEvent(game, ctx, ex, ey + 1.5f, ez);
 
-                        // 等待按钮被开启
-                        while (entity.data.isDeath.UpdateAddress().UpdateData().data != 0)
+                        // 等待按钮被开启 偶然发现这里的开关存活状态居然会失效 那就采用坐标+停留时间判定
+                        auto chestStartTime = std::chrono::steady_clock::now();
+                        while (entity.data.isDeath.UpdateAddress().UpdateData().data != 0 || EntityStillExists(game, entity))
                         {
+                            if (functionRunMap[{pid, "FollowTarget"}].load() == false)
+                                return;
+                            // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
+                            MoveUntilReached(game, ex, ey + 1.5f, ez);
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                            float ax = game.data.player.data.coord.data.x.UpdateData().data;
+                            float ay = game.data.player.data.coord.data.y.UpdateData().data;
+                            float az = game.data.player.data.coord.data.z.UpdateData().data;
+                            float currentDist = CalculateDistance(ax, ay, az, ex, ey, ez);
+                            if (currentDist < 3.0f)
+                            {
+                                // 计算已经卡在宝箱附近的时间
+                                auto now = std::chrono::steady_clock::now();
+                                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - chestStartTime).count();
+                                // 如果超过15秒，加入黑名单
+                                if (elapsed >= 3)
+                                {
+                                    LOGF("[5*开关存活状态疑似bug] => 坐标已滞留满3秒");
+                                    // 加锁保护黑名单列表
+                                    std::lock_guard<std::mutex> lock(Module::blacklistMutex);
+                                    // 如果黑名单已满，移除最旧的条目
+                                    if (Module::blacklistedChests.size() >= 1000)
+                                        Module::blacklistedChests.pop_front();
+                                    // 添加新条目
+                                    Module::blacklistedChests.emplace_back(ex, ey, ez);
+                                    break;
+                                }
+                            }
                         }
 
                         std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime));
                         int emptyStreak = 0;
                         while (emptyStreak < 3 && functionRunMap[{pid, "FollowTarget"}].load())
                         {
+                            if (functionRunMap[{pid, "FollowTarget"}].load() == false)
+                                return;
                             std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
                                 game,
                                 ex, ey, ez,
@@ -1385,20 +1488,21 @@ namespace Module
                                 /*targetBoss=*/true,
                                 /*targetPlant=*/false,
                                 /*targetNormal=*/false,
-                                _targetRegexs,
-                                _noTargetRegexs,
+                                _targets,
+                                _noTargets,
                                 bossLevel);
 
                             if (!entitys.empty())
                             {
                                 KillEntitys(pid, entitys, game, ctx, 2000,
                                             std::string(tab + " [[5*]") + name + "]",
-                                            e, noTargetRegexs);
+                                            e, targets, noTargets);
                                 continue;
                             }
                             else
                             {
-                                MoveEvent(game, ctx, ex, ey + 1.5f, ez);
+                                // MoveEvent(game, ctx, ex, ey, ez);
+                                MoveUntilReached(game, ex, ey, ez);
                                 std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime));
                             }
 
@@ -1426,7 +1530,8 @@ namespace Module
                 //                   /*stopDist=*/1.0f, /*timeout=*/60000,
                 //                   /*slowRadius=*/8.0f, /*accelPerTick=*/0.8f, /*speedCap=*/10.0f);
 
-                MoveEvent(game, ctx, ex, ey + 1.5f, ez);
+                // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
+                MoveUntilReached(game, ex, ey + 1.5f, ez);
             }
             if (sleepTime != 0 && overEntity.address == 0)
             {
@@ -1434,44 +1539,55 @@ namespace Module
                 {
                     continue;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(sleepTime));
 
-                game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
-                float lx = game.data.player.data.coord.data.x.UpdateData().data;
-                float ly = game.data.player.data.coord.data.y.UpdateData().data;
-                float lz = game.data.player.data.coord.data.z.UpdateData().data;
-                auto chestList = GetEntitysWithPriority(
-                    game,
-                    lx, ly, lz,    // 以怪最后坐标为圆心
-                    /*range=*/100, // 半径 10~15m 都行
-                    /*targetBoss=*/false,
-                    /*targetPlant=*/false,
-                    /*targetNormal=*/false,
-                    tr, nr,
-                    1 // 这个参数你函数签名需要，填 bossLevel 即可
-                );
+                using clock = std::chrono::steady_clock;
+                const auto deadline = clock::now() + std::chrono::milliseconds(2000);
+                const auto tick = std::chrono::milliseconds(120); // 轮询步长(可调)
 
-                // 2) 只保留“优先宝箱”三类（small/large/rune_vault）
-                chestList.erase(
-                    std::remove_if(
-                        chestList.begin(),
-                        chestList.end(),
-                        [&](PrioritizedEntity &pe)
-                        {
-                            std::string nm = pe.entity.data.name.UpdateData(128).data;
-                            // 保留“名字中包含任一优先宝箱关键字”的实体
-                            bool isPriorityChest = std::any_of(
-                                priorityChests.begin(),
-                                priorityChests.end(),
-                                [&](const std::string &key)
-                                { return !key.empty() && nm.find(key) != std::string::npos; });
-                            return !isPriorityChest; // 返回 true 表示“删除”
-                        }),
-                    chestList.end());
+                std::vector<PrioritizedEntity> chestList;
 
-                if (!chestList.empty())
+                while (clock::now() < deadline && functionRunMap[{pid, "FollowTarget"}].load())
                 {
-                    KillEntitys(pid, chestList, game, ctx, /*sleepTime=*/0, "", e, noTargetRegexs);
+                    // 刷新自己坐标
+                    game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                    float lx = game.data.player.data.coord.data.x.UpdateData().data;
+                    float ly = game.data.player.data.coord.data.y.UpdateData().data;
+                    float lz = game.data.player.data.coord.data.z.UpdateData().data;
+
+                    // 拉取 100m 内候选
+                    chestList = GetEntitysWithPriority(
+                        game,
+                        lx, ly, lz,
+                        /*range=*/10,
+                        /*targetBoss=*/false,
+                        /*targetPlant=*/false,
+                        /*targetNormal=*/false,
+                        priorityChests, nr,
+                        /*paramBossLevel=*/1);
+
+                    // 只保留优先宝箱三类
+                    chestList.erase(
+                        std::remove_if(
+                            chestList.begin(), chestList.end(),
+                            [&](PrioritizedEntity &pe)
+                            {
+                                std::string nm = pe.entity.data.name.UpdateData(128).data;
+                                bool isPriorityChest = std::any_of(
+                                    priorityChests.begin(), priorityChests.end(),
+                                    [&](const std::string &key)
+                                    { return !key.empty() && nm.find(key) != std::string::npos; });
+                                return !isPriorityChest;
+                            }),
+                        chestList.end());
+
+                    if (!chestList.empty())
+                    {
+                        // 命中则立刻处理，不再等足 2 秒
+                        KillEntitys(pid, chestList, game, ctx, /*sleepTime=*/0, /*tab=*/"", e, targets, noTargets);
+                        break;
+                    }
+
+                    std::this_thread::sleep_for(tick); // 短退避后继续探测
                 }
             }
         }
@@ -1633,102 +1749,74 @@ namespace Module
 
     void GetNextPoint(float &x, float &z, std::unordered_set<std::string> &visitedPoints)
     {
-        const float sqrt3 = std::sqrt(3.0f);
-
-        // 用户设定的最大步距（保留你原语义）
-        const float e_user = std::max(1.0f, static_cast<float>(entityScand));
-
-        // ★ 保守半径：固定按 45m 计算（你说“假设我的扫描只有45”）
-        //    如果你想随 realisticScanRange 走，可把 r_pref 改成 std::min<float>(Module::realisticScanRange, 45.0f)
-        const float r_pref = 45.0f;
-
-        // 覆盖条件：e ≤ r·√3/2；再乘一个安全系数（越小越保守），再减 1m 余量
-        // 说明：r=45 时，理论上 e_max≈38.97；这里乘 0.85 之后≈33.12，再减 1 -> 约 32
-        const float safety_k = 0.85f; // ← 如果还漏，可降到 0.80
-        float e_cov = std::floor(r_pref * (sqrt3 * 0.5f) * safety_k - 1.0f);
-        if (e_cov < 1.0f)
-            e_cov = 1.0f;
-
-        // 取最终步距：不超过用户设定，也不超过覆盖上限
-        const float e = std::min(e_user, e_cov);
-
-        // 半径 R 用新的 e 计算
-        const int R = static_cast<int>(std::max(1.0f, static_cast<float>(mapWidth) / (2.0f * e)));
-
-        // #ifdef ENTITY_FIELD_DEBUG
-        //         LOGF("[扫格步距] entityScand=%.1f, realisticScanRange=%u, r_scan=%.1f → e=%.1f (邻格距=%.1f)",
-        //              e_user, Module::realisticScanRange, r_scan, e, 2.0f * e);
-        // #endif
-
-        auto clampIndex = [&](int &i, int &j)
+        const float sqrt3 = std::sqrt(3);
+        const float e = entityScand;
+        const int R = static_cast<int>(mapWidth / (2 * e));
+        auto alignToGrid = [&](float &x, float &z)
         {
-            i = std::clamp(i, -R, R);
-            j = std::clamp(j, -R, R);
-            while (i * i + i * j + j * j > R * R)
+            int j = static_cast<int>(std::round(z / (e * sqrt3)));
+            int i = static_cast<int>(std::round((x - e * j) / (2 * e)));
+            auto clampIndex = [&](int &i, int &j)
             {
-                if (std::abs(i) > std::abs(j))
-                    i += (i > 0 ? -1 : +1);
-                else
-                    j += (j > 0 ? -1 : +1);
-            }
-        };
-        auto posToIJ = [&](float X, float Z, int &i, int &j)
-        {
-            j = static_cast<int>(std::round(Z / (e * sqrt3)));
-            i = static_cast<int>(std::round((X - e * j) / (2 * e)));
-            clampIndex(i, j);
-        };
-        auto ijToPos = [&](int i, int j, float &X, float &Z)
-        {
-            X = e * (2 * i + j);
-            Z = e * sqrt3 * j;
-        };
-        auto keyIJ = [&](int i, int j)
-        {
-            return std::to_string(i) + "|" + std::to_string(j);
-        };
-
-        int ci, cj;
-        posToIJ(x, z, ci, cj);
-
-        static const int di[6] = {+1, -1, 0, 0, +1, -1};
-        static const int dj[6] = {0, 0, +1, -1, -1, +1};
-
-        std::queue<std::pair<int, int>> q;
-        std::unordered_set<std::string> seen;
-        q.push({ci, cj});
-        seen.insert(keyIJ(ci, cj));
-
-        while (!q.empty())
-        {
-            auto [ti, tj] = q.front();
-            q.pop();
-            for (int k = 0; k < 6; ++k)
-            {
-                int ni = ti + di[k], nj = tj + dj[k];
-                clampIndex(ni, nj);
-                std::string K = keyIJ(ni, nj);
-                if (seen.count(K))
-                    continue;
-                seen.insert(K);
-
-                if (!visitedPoints.count(K))
+                i = std::clamp(i, -R, R);
+                j = std::clamp(j, -R, R);
+                while (i * i + i * j + j * j > R * R)
                 {
-                    visitedPoints.insert(K);
-                    ijToPos(ni, nj, x, z);
-                    return;
+                    if (std::abs(i) > std::abs(j))
+                        i > 0 ? i-- : i++;
+                    else
+                        j > 0 ? j-- : j++;
                 }
-                q.push({ni, nj});
+            };
+            clampIndex(i, j);
+            x = e * (2 * i + j);
+            z = e * sqrt3 * j;
+        };
+        auto getKey = [](float x, float z)
+        {
+            return std::to_string(static_cast<int>(std::round(x))) + "|" +
+                   std::to_string(static_cast<int>(std::round(z)));
+        };
+        alignToGrid(x, z);
+        if (visitedPoints.insert(getKey(x, z)).second)
+            return;
+        std::vector<std::pair<float, float>> directions = {
+            {2 * e, 0}, {-2 * e, 0}, {e, e * sqrt3}, {-e, e * sqrt3}, {e, -e * sqrt3}, {-e, -e * sqrt3}};
+        std::shuffle(directions.begin(), directions.end(), std::mt19937(std::random_device{}()));
+        std::queue<std::pair<float, float>> searchQueue;
+        std::unordered_set<std::string> checkedPoints;
+        searchQueue.push({x, z});
+        checkedPoints.insert(getKey(x, z));
+        while (!searchQueue.empty())
+        {
+            auto [currentX, currentZ] = searchQueue.front();
+            searchQueue.pop();
+            for (const auto &[dx, dz] : directions)
+            {
+                float newX = currentX + dx;
+                float newZ = currentZ + dz;
+                alignToGrid(newX, newZ);
+                std::string key = getKey(newX, newZ);
+                float dist = std::sqrt(newX * newX + newZ * newZ);
+                if (dist > mapWidth)
+                    continue;
+                if (!checkedPoints.count(key))
+                {
+                    checkedPoints.insert(key);
+                    if (!visitedPoints.count(key))
+                    {
+                        visitedPoints.insert(key);
+                        x = newX;
+                        z = newZ;
+                        return;
+                    }
+                    searchQueue.push({newX, newZ});
+                }
             }
         }
-
         visitedPoints.clear();
-        int ni = std::clamp(ci - 1, -R, R), nj = cj;
-        clampIndex(ni, nj);
-        visitedPoints.insert(keyIJ(ni, nj));
-        ijToPos(ni, nj, x, z);
+        visitedPoints.insert(getKey(x, z));
     }
-
 }
 
 void UpdateConfig(const char *key, const char *value)

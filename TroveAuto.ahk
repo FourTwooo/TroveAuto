@@ -23,7 +23,16 @@ logger.is_out_file := true         ; 文件
 ; logger.is_use_editor := true        ; VSCode/DebugView
 
 ; 文件路径（建议继续沿用你原 Entity.log）
-DirCreate(A_ScriptDir "\logs")
+DirCreate(A_ScriptDir "\UseLog")
+logPath := A_ScriptDir "\UseLog\Entity.log"
+try logger.set_file(logPath)
+catch
+    try logger.file_path := logPath
+    catch
+        try logger.path := logPath
+        catch
+            logger.level := logger.level_trace
+logger.info("logger ready → ", logPath)
 
 ; --- DLL→AHK 级别映射 & 回调函数 ---
 global AHK_LOG_TRACE := 0, AHK_LOG_DEBUG := 1, AHK_LOG_INFO := 2
@@ -52,6 +61,7 @@ AhkLogSink(level, pMsg) {
     }
 }
 
+SetLogPathA := DynaCall("Module\SetLogPathA", ["a"])
 LogOn := DynaCall("Module\LogOn", ["i"])
 
 CloseHandle := DynaCall("CloseHandle", ["c=ui"])
@@ -66,6 +76,36 @@ FunctionOn := DynaCall("Module\FunctionOn", ["uiaai"])
 FunctionOff := DynaCall("Module\FunctionOff", ["uia"])
 
 WhichTarget := DynaCall("Module\WhichTarget", ["uituia"])
+
+InitLogger() {
+    ; --- 终端（控制台）——保证有窗口可打印 ---
+    if !DllCall("kernel32\GetConsoleWindow", "ptr")
+        DllCall("kernel32\AllocConsole")
+    ; 中文不乱码（UTF-8）
+    DllCall("kernel32\SetConsoleOutputCP", "UInt", 65001)
+    DllCall("kernel32\SetConsoleCP", "UInt", 65001)
+
+    ; --- 输出目标 ---
+    logger.is_out_console := true        ; 打到控制台
+    logger.is_out_file := true        ; 同时落盘
+    ; logger.is_use_editor := true       ; 需要的话打开：发到 VSCode/DebugView（OutputDebug）
+
+    ; 日志级别（越“细”越多）：trace > debug > info > warn > err > critical
+    logger.level := logger.level_trace
+
+    ; --- 文件路径：指向你原本的 UseLog\Entity.log （可换为独立 AHK 日志文件）---
+    DirCreate(A_ScriptDir "\UseLog")
+    logPath := A_ScriptDir "\UseLog\Entity.log"
+
+    ; 不同版本可能方法名不同，这里做兼容尝试；若都失败，库就用它的默认路径
+    try logger.set_file(logPath)
+    catch
+        try logger.file_path := logPath
+        catch
+            try logger.path := logPath
+            catch
+                logger.info("Logger ready → ", logPath)
+}
 
 SetTitleMatchMode("RegEx")
 
@@ -470,8 +510,8 @@ GameStart(GuiCtrlObj := unset, Info := unset) {
         MsgBox(t("游戏启动失败, 请检查游戏路径"))
 }
 OpenUseLogPath(GuiCtrlObj, Info) {
-    DirCreate("logs")
-    try Run("explore logs\")
+    DirCreate("UseLog")
+    try Run("explore UseLog\")
     catch
         MsgBox(t("日志文件夹打开失败, 请检查文件夹是否存在"))
 }
@@ -1190,9 +1230,9 @@ class Game {
         }
         UseLog(Pid, Name, BaseAddress, ProcessHandle, Interval, Use_R, Use_T) {
             Global STOP
-            DirCreate("logs")
+            DirCreate("UseLog")
             AobScan := DynaCall("Module\AobScanFindSig", ["ui=tuiuiaui6ui6i"])
-            FileObj := FileOpen("logs\" Name " " FormatTime(, "yyyy-MM-dd") ".txt", "a")
+            FileObj := FileOpen("UseLog\" Name " " FormatTime(, "yyyy-MM-dd") ".txt", "a")
             Result := Buffer(1024, 0)
             signature_r := StrSplit(RegExReplace(StrReplace(Use_R, " "), "X|x", "?"), ',')
             signature_t := StrSplit(RegExReplace(StrReplace(Use_T, " "), "X|x", "?"), ',')
@@ -1589,7 +1629,7 @@ class Game {
 }
 
 Reset()
-DirCreate("logs")
+DirCreate("UseLog")
 ; 这里 logger 你前面已经初始化过了（你上面那段控制台+logger配置）。要么保留上面的初始化，
 ; 要么只调用你写的 InitLogger()，二选一。为了简单，这里就不再重复 InitLogger() 了。
 ; 如果你想用你的 InitLogger()，就在这里调用：InitLogger()
@@ -1605,9 +1645,12 @@ DllCall("Module\SetLogRoute", "UInt", 1)
 
 ; 3) 如果 route=1，就不要再让 DLL 自己落盘（避免重复/冲突）
 ;    若你真的想让 DLL 也写文件（设 3），这行可以保留。
+; ; SetLogPathA(A_ScriptDir "\UseLog\Entity.log")
 
 ; 4) 最后再打开 DLL 日志开关
+SetLogPathA(A_ScriptDir "\UseLog\Entity.log")  ; 让 DLL 写到固定文件
 LogOn(1)                                        ; 开启日志（随时可 LogOn(0) 关闭）
+InitLogger()
 MainGui.Show()
 Save()
 Persistent
