@@ -17,10 +17,10 @@ if !DllCall("kernel32\GetConsoleWindow", "ptr")
 DllCall("kernel32\SetConsoleOutputCP", "UInt", 65001)
 DllCall("kernel32\SetConsoleCP", "UInt", 65001)
 
-; logger 输出端
-logger.is_out_console := true         ; 终端
-logger.is_out_file := true         ; 文件
-; logger.is_use_editor := true        ; VSCode/DebugView
+logger.set_pattern("[%Y-%m-%d %H:%M:%S] [thread %=7t] [%=8l] %^%v%$")
+logger.is_out_console := true    ; 终端
+logger.is_out_file := true       ; 文件
+; logger.is_use_editor := true   ; VSCode/DebugView
 
 ; 文件路径（建议继续沿用你原 Entity.log）
 DirCreate(A_ScriptDir "\logs")
@@ -49,6 +49,42 @@ AhkLogSink(level, pMsg) {
         case AHK_LOG_ERR: logger.err(msg)
         case AHK_LOG_CRIT: logger.critical(msg)
         default: logger.info(msg)
+    }
+}
+
+; 显示控制台（若没有则分配），并设置 UTF-8
+EnsureConsoleVisible() {
+    if !DllCall("kernel32\GetConsoleWindow", "ptr")
+        DllCall("kernel32\AllocConsole")
+    DllCall("kernel32\SetConsoleOutputCP", "UInt", 65001)
+    DllCall("kernel32\SetConsoleCP", "UInt", 65001)
+    hwnd := DllCall("kernel32\GetConsoleWindow", "ptr")
+    if (hwnd)
+        DllCall("user32\ShowWindow", "ptr", hwnd, "int", 5) ; SW_SHOW
+}
+
+; 隐藏控制台窗口（不销毁，便于下次秒唤醒）
+HideConsole() {
+    hwnd := DllCall("kernel32\GetConsoleWindow", "ptr")
+    if (hwnd)
+        DllCall("user32\ShowWindow", "ptr", hwnd, "int", 0) ; SW_HIDE
+}
+
+global g_console_log_on := true  ; 控制台日志开关
+ToggleConsoleLog(ItemName, ItemPos, MyMenu) {
+    global g_console_log_on, logger
+    g_console_log_on := !g_console_log_on
+    logger.is_out_console := g_console_log_on
+
+    if g_console_log_on {
+        EnsureConsoleVisible()
+        ; 菜单文案可切换为“关闭终端日志”
+        MyMenu.Rename(ItemName, t("关闭终端日志"))
+        logger.info("终端日志：已开启（文件日志仍然写入）")
+    } else {
+        HideConsole()
+        try MyMenu.Rename(ItemName, t("开启终端日志"))
+        logger.info("终端日志：已关闭（文件日志仍然写入）")
     }
 }
 
@@ -107,21 +143,21 @@ config := _Config(
             "Fish", "f",
         ),
         "Address", Map(
-            "Animation", "0x74B065",
-            "Attack", "0xB18278",
-            "Breakblocks", "0x965523",
-            "ByPass", "0x1AC696",
-            "ClipCam", "0xA7B51A",
-            "Dismount", "0x340D7E",
+            "Animation", "0x74DF95",
+            "Attack", "0xB28678",
+            "Breakblocks", "0x8E9913",
+            "ByPass", "0x1E0626",
+            "ClipCam", "0x8D453A",
+            "Dismount", "0x33CA8E",
             "Fish", "0x10947A4",
-            "LockCam", "0x968655",
-            "Map", "0xA0ABBD",
-            "Mining", "0xA7C348",
-            "MiningGeode", "0x8844F7",
-            "NoClip", "0x63F042",
+            "LockCam", "0x8E2C45",
+            "Map", "0x8926AD",
+            "Mining", "0xAD2948",
+            "MiningGeode", "0xB12FB7",
+            "NoClip", "0x646B72",
             "Player", "0x1098438",
             "World", "0x10984B0",
-            "Zoom", "0xA79496",
+            "Zoom", "0x8D2476",
         ),
         "Address_Offset", Map(
             "Name", "0x0,0x28,0x1D0,0x0",
@@ -422,9 +458,10 @@ MainGui["Top_WhichTarget"].OnEvent("Click", Top_WhichTarget)
 
 ; 托盘图标
 A_TrayMenu.Delete()
-A_TrayMenu.Add(t("显示"), (ItemName, ItemPos, MyMenu) => (MainGui.Show()))
+A_TrayMenu.Add(t("显示 主程序"), (ItemName, ItemPos, MyMenu) => (MainGui.Show()))
 A_TrayMenu.Add(t("重新启动"), (ItemName, ItemPos, MyMenu) => (Game.Reset(), Reload()))
 A_TrayMenu.Add(t("退出"), (ItemName, ItemPos, MyMenu) => (Game.Reset(), ExitApp()))
+A_TrayMenu.Add(t("关闭终端日志"), (ItemName, ItemPos, MyMenu) => (ToggleConsoleLog(ItemName, ItemPos, MyMenu)))
 
 ; 交互函数
 Close(thisGui) {
@@ -776,7 +813,8 @@ Top_WhichTarget(GuiCtrlObj, Info) {
                     result := StrSplit(StrGet(Mvalue, "utf-8"), ',')
                     if (result.Length >= 7) {
                         A_Clipboard := result[1]
-                        s := Format(t("名称(见剪贴板): {1}`n等级: {2} 血量: {3} 距离: {4}`n坐标(XYZ): {5},{6},{7}"), result[1], result[2], result[3], result[4], result[5], result[6], result[7])
+                        s := Format(t("名称(见剪贴板): {1}`n等级: {2} 血量: {3} 距离: {4}`n坐标(XYZ): {5},{6},{7}"), result[1],
+                        result[2], result[3], result[4], result[5], result[6], result[7])
                         logger.debug(s)
                         ToolTip(s)
                         SetTimer(() => ToolTip(), -3000)
