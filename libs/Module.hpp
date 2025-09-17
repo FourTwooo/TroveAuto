@@ -67,6 +67,8 @@
 #include <iterator>
 #include <vector>
 
+bool isDevTools = false;
+
 float CalculateDistance(const float &ax, const float &ay, const float &az, const float &bx, const float &by, const float &bz)
 {
     float dx = ax - bx;
@@ -87,20 +89,20 @@ std::string trim(const std::string &str)
     return str.substr(start, end - start + 1);
 }
 
-// 添加一个辅助函数来连接字符串向量
-std::string join(const std::vector<std::string> &vec, const std::string &delimiter)
-{
-    std::ostringstream oss;
-    for (size_t i = 0; i < vec.size(); ++i)
-    {
-        if (i != 0)
-        {
-            oss << delimiter;
-        }
-        oss << vec[i];
-    }
-    return oss.str();
-}
+// // 添加一个辅助函数来连接字符串向量
+// std::string join(const std::vector<std::string> &vec, const std::string &delimiter)
+// {
+//     std::ostringstream oss;
+//     for (size_t i = 0; i < vec.size(); ++i)
+//     {
+//         if (i != 0)
+//         {
+//             oss << delimiter;
+//         }
+//         oss << vec[i];
+//     }
+//     return oss.str();
+// }
 
 // 创建正则表达式向量的辅助函数
 auto createRegexVector = [](const auto &strings)
@@ -707,10 +709,11 @@ namespace Module
         int priority;
         Game::World::Entity entity;
         float distance;
+        std::string name;
 
         // 添加一个构造函数
-        PrioritizedEntity(int p, Game::World::Entity e, float d)
-            : priority(p), entity(e), distance(d) {}
+        PrioritizedEntity(int p, Game::World::Entity e, float d, std::string n)
+            : priority(p), entity(e), distance(d), name(n) {}
 
         // 自定义比较运算符，用于排序
         bool operator<(const PrioritizedEntity &other) const
@@ -773,32 +776,25 @@ namespace Module
         uint32_t paramBossLevel)
     {
 
-        // auto b2s = [](bool v)
-        // { return v ? "true" : "false"; };
-        // auto joinQuoted = [](const std::vector<std::string> &v)
-        // {
-        //     std::string s;
-        //     s.reserve(64);
-        //     s += '[';
-        //     for (size_t i = 0; i < v.size(); ++i)
-        //     {
-        //         if (i)
-        //             s += ", ";
-        //         s += '\'';
-        //         s += v[i];
-        //         s += '\'';
-        //     }
-        //     s += ']';
-        //     return s;
-        // };
+        auto b2s = [](bool v)
+        { return v ? "true" : "false"; };
+        auto joinQuoted = [](const std::vector<std::string> &v)
+        {
+            std::string s;
+            s.reserve(64);
+            s += '[';
+            for (size_t i = 0; i < v.size(); ++i)
+            {
+                if (i)
+                    s += ", ";
+                s += '\'';
+                s += v[i];
+                s += '\'';
+            }
+            s += ']';
+            return s;
+        };
 
-        // LOGF("[GetEntitysWithPriority] ax=%.2f ay=%.2f az=%.2f range=%u boss=%s plant=%s normal=%s level=%u "
-        //      "targets=%s noTargets=%s",
-        //      ax, ay, az, range,
-        //      b2s(targetBoss), b2s(targetPlant), b2s(targetNormal),
-        //      paramBossLevel,
-        //      joinQuoted(targets).c_str(),
-        //      joinQuoted(noTargets).c_str());
         noTargets.reserve(noTargets.size() + timeOutIds.size());                 // 先预留，避免多次扩容
         noTargets.insert(noTargets.end(), timeOutIds.begin(), timeOutIds.end()); // 追加
 
@@ -816,6 +812,7 @@ namespace Module
             distance = 0;
             priority = 0;
             entity.UpdateAddress().UpdateData();
+            entity.data.level.UpdateData();
 
             // 如果实体已死亡，跳过处理
             if (entity.data.isDeath.UpdateData().data == 0)
@@ -908,8 +905,21 @@ namespace Module
             {
                 continue;
             }
+
+            if (isDevTools)
+            {
+                LOGD("[GetEntitysWithPriority] name=%s priority=%d  ax=%.2f ay=%.2f az=%.2f range=%u boss=%s plant=%s normal=%s level=%u "
+                     "targets=%s noTargets=%s",
+                     name.c_str(),
+                     priority,
+                     ax, ay, az, range,
+                     b2s(targetBoss), b2s(targetPlant), b2s(targetNormal),
+                     paramBossLevel,
+                     joinQuoted(targets).c_str(),
+                     joinQuoted(noTargets).c_str());
+            }
             // 使用构造函数创建 PrioritizedEntity 对象
-            result.push_back(PrioritizedEntity(priority, entity, distance));
+            result.push_back(PrioritizedEntity(priority, entity, distance, name));
         }
 
         // 排序
@@ -927,64 +937,6 @@ namespace Module
         float speed = 50.f;
         Memory::DWORD pid = 0;
     };
-
-    // inline void MoveEvent(Game &game, MoveCtx &ctx,
-    //                       float tx, float ty, float tz)
-    // {
-    //     // 阻塞参数：每 tick 间隔=ctx.safeDelay（你外面已设置），最大阻塞时长=8s
-    //     const uint32_t dt = std::max<uint32_t>(1, ctx.safeDelay);
-    //     const uint32_t TIMEOUTMS = 60000;
-    //     const uint32_t MAXTICKS = std::max<uint32_t>(1, TIMEOUTMS / dt);
-
-    //     // 与老版一致的平滑速度（跨调用保留，如需按线程隔离可改 thread_local）
-    //     static float pvx = 0.f, pvy = 0.f, pvz = 0.f;
-    //     const float alpha = 0.35f;
-
-    //     // 进入前不清速，保持老版行为（如需清速，可在此三行置 0）
-    //     // game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-    //     // game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-    //     // game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-
-    //     for (uint32_t t = 0; t < MAXTICKS; ++t)
-    //     {
-    //         // 当前位置（保持老版：仅 UpdateData）
-    //         float x = game.data.player.data.coord.data.x.UpdateData().data;
-    //         float y = game.data.player.data.coord.data.y.UpdateData().data;
-    //         float z = game.data.player.data.coord.data.z.UpdateData().data;
-
-    //         float dx = tx - x, dy = ty - y, dz = tz - z;
-    //         float dist = std::sqrt(dx * dx + dy * dy + dz * dz);
-    //         if (!(dist > 1.0f) || std::isnan(dist))
-    //         {
-    //             // 到达或无效 → 清速后返回
-    //             game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-    //             game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-    //             game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-    //             return;
-    //         }
-
-    //         // 老版速度：模长恒等于 ctx.speed（无任何限速/减速）
-    //         const float inv = ctx.speed / std::max(dist, 1e-3f);
-    //         const float dvx = dx * inv, dvy = dy * inv, dvz = dz * inv;
-
-    //         // 指数平滑（alpha=0.35）
-    //         pvx = pvx + alpha * (dvx - pvx);
-    //         pvy = pvy + alpha * (dvy - pvy);
-    //         pvz = pvz + alpha * (dvz - pvz);
-
-    //         // 写速度（写入前 UpdateAddress，保持你的写法）
-    //         game.data.player.data.coord.data.xVel.UpdateAddress() = pvx;
-    //         game.data.player.data.coord.data.yVel.UpdateAddress() = pvy;
-    //         game.data.player.data.coord.data.zVel.UpdateAddress() = pvz;
-
-    //         std::this_thread::sleep_for(std::chrono::milliseconds(dt));
-    //     }
-
-    //     // 超时：停速后返回（不会继续跑）
-    //     game.data.player.data.coord.data.xVel.UpdateAddress() = 0.f;
-    //     game.data.player.data.coord.data.yVel.UpdateAddress() = 0.f;
-    //     game.data.player.data.coord.data.zVel.UpdateAddress() = 0.f;
-    // }
 
     bool MoveUntilReached(
         Game &game,
@@ -1168,7 +1120,7 @@ namespace Module
                         targetZ = game.data.player.data.coord.data.z.UpdateData().data;
                         GetNextPoint(targetX, targetZ, visitedPoints);
                         LOGF("[周边扫描无名单前往新格中心] => (%.0f,%.0f,%.0f)", targetX, targetY, targetZ);
-                        std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+                        std::this_thread::sleep_for(std::chrono::milliseconds(200));
                     }
                 }
             }
@@ -1218,6 +1170,8 @@ namespace Module
         std::vector<std::string> targets,
         std::vector<std::string> noTargets)
     {
+        int idx = 0;
+        int total = static_cast<int>(entitys.size());
         static std::unordered_set<uintptr_t> printed;
 
         Game::World::Entity e(static_cast<Object<> &>(game));
@@ -1229,10 +1183,7 @@ namespace Module
         // 遍历entitys并输出日志
         for (auto &pe : entitys)
         {
-            Game::World::Entity entity = pe.entity;
-            std::string name = entity.data.name.UpdateData(128).data; // 每次都取 string
-
-            // LOGF("%s", name.c_str());
+            ++idx;
             // 依据名字是否命中 ButtonStarts 选择不同超时
             auto isButtonStart = [&](const std::string &nm)
             {
@@ -1243,6 +1194,14 @@ namespace Module
                         return !key.empty() && nm.find(key) != std::string::npos; // 子串命中即可
                     });
             };
+            auto makeKey = [&](uintptr_t a, const std::string &nm, const std::string &tb) -> uint64_t
+            {
+                return (uint64_t)a ^ (std::hash<std::string>{}(tb) << 1) ^ (std::hash<std::string>{}(nm) << 2);
+            };
+
+            bool is_continue = false;
+            Game::World::Entity entity = pe.entity;
+            std::string name = entity.data.name.UpdateData(128).data; // 每次都取 string
 
             const auto t0 = std::chrono::steady_clock::now();
             const uint32_t timeoutMs = isButtonStart(name) ? 4u * 60u * 1000u : 1u * 60u * 1000u; // 4min / 2min
@@ -1251,6 +1210,16 @@ namespace Module
             {
                 if (functionRunMap[{pid, "FollowTarget"}].load() == false)
                     return;
+
+                if (name != pe.name)
+                {
+                    if (isDevTools)
+                    {
+                        LOGW("[%02d|%02d][警告] 遇到实体名字变化，已跳过该目标 (旧=%s, 新=%s)", idx, total, pe.name.c_str(), name.c_str());
+                    }
+                    is_continue = true;
+                    break;
+                }
 
                 // 加入这个方法迫于无奈 发现祭坛嵌套刷小怪代码 有极小规律卡传送门不停跟踪. 很难理解
                 if (overEntity.address != 0)
@@ -1280,15 +1249,16 @@ namespace Module
                     }
                     if (is_targets)
                     {
-                        LOGE("[超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [未拉入临时黑名单. 因为他存在目标名单中.]",
-                             name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                        LOGE("[%02d|%02d][超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [未拉入临时黑名单. 因为他存在目标名单中.]",
+                             idx, total, name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
                     }
                     else
                     {
                         timeOutIds.emplace_back(name);
-                        LOGE("[超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [已拉入本次运行临时黑名单. 如需匹配请重启软件]",
-                             name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                        LOGE("[%02d|%02d][超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [已拉入本次运行临时黑名单. 如需匹配请重启软件]",
+                             idx, total, name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
                     }
+                    is_continue = true;
                     break;
                 }
                 entity.UpdateAddress().UpdateData();
@@ -1307,12 +1277,12 @@ namespace Module
                     //      pe.priority,
                     //      entity.data.level.UpdateAddress().UpdateData().data,
                     //      ex, ey, ez);
-
+                    is_continue = true;
                     break; // 遇到哨兵坐标就跳过
                 }
 
                 // ★ 用“地址+tab”做复合键，避免递归时同地址被抑制
-                uint64_t pkey = (uint64_t)addr ^ (std::hash<std::string>{}(tab) << 1);
+                uint64_t pkey = makeKey(addr, name, tab);
 
                 if (IsEmptyId(name))
                 {
@@ -1321,15 +1291,18 @@ namespace Module
                     //      entity.data.level.UpdateAddress().UpdateData().data,
                     //      ex, ey, ez);
                     printed.erase(pkey);
+                    is_continue = true;
                     break; // 遇到空ID就跳过
                 }
                 // 进入该目标时打印一次
                 if (printed.insert(pkey).second)
                 {
                     std::string TAB = std::string("[已发现]" + tab + " => ");
-                    LOGF("%sid:%s, 优先级:%d, 初距:%.2f, 等级:%u, 坐标(%.2f, %.2f, %.2f)",
+                    LOGF("[%02d|%02d]%sid:%s, old_id:%s, 优先级:%d, 初距:%.2f, 等级:%u, 坐标(%.2f, %.2f, %.2f)",
+                         idx, total,
                          TAB.c_str(),
                          name.c_str(),
+                         pe.name.c_str(),
                          pe.priority,
                          pe.distance, // 这是快照距离；若要实时距离，可改成现算
                          entity.data.level.UpdateAddress().UpdateData().data,
@@ -1339,7 +1312,8 @@ namespace Module
                 if (entity.data.isDeath.UpdateAddress().UpdateData().data == 0 || !EntityStillExists(game, entity))
                 {
                     std::string TAB = std::string("[已消失]" + tab + " => ");
-                    LOGF("%sid: %s, 优先级: %d",
+                    LOGF("[%02d|%02d]%sid: %s, 优先级: %d",
+                         idx, total,
                          TAB.c_str(),
                          name.c_str(),
                          pe.priority);
@@ -1406,7 +1380,7 @@ namespace Module
                         }
                         _noTargets.emplace_back("quest_assault_trigger");
                         _noTargets.emplace_back(".*portal_.*");
-                        std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
+                        std::vector<PrioritizedEntity> _entitys = GetEntitysWithPriority(
                             game,
                             ex, ey, ez,
                             10,
@@ -1416,9 +1390,9 @@ namespace Module
                             _targets,
                             _noTargets,
                             2);
-                        if (!entitys.empty())
+                        if (!_entitys.empty())
                         {
-                            KillEntitys(pid, entitys, game, ctx, 1, std::string(tab + " [[祭坛]") + name + "]", entity, targets, noTargets);
+                            KillEntitys(pid, _entitys, game, ctx, 1, std::string(tab + " [[祭坛]") + name + "]", entity, targets, noTargets);
                         }
                     }
                     else if (name.find("quest_spawn_trigger_fivestar") != std::string::npos || name.find("quest_spawn_trigger_fivestar_depths") != std::string::npos)
@@ -1463,13 +1437,7 @@ namespace Module
                                 if (elapsed >= 3)
                                 {
                                     LOGF("[5*开关存活状态疑似bug] => 坐标已滞留满3秒");
-                                    // 加锁保护黑名单列表
-                                    std::lock_guard<std::mutex> lock(Module::blacklistMutex);
-                                    // 如果黑名单已满，移除最旧的条目
-                                    if (Module::blacklistedChests.size() >= 1000)
-                                        Module::blacklistedChests.pop_front();
-                                    // 添加新条目
-                                    Module::blacklistedChests.emplace_back(ex, ey, ez);
+                                    entity.data.isDeath.UpdateAddress().UpdateData().data = 0;
                                     break;
                                 }
                             }
@@ -1481,7 +1449,7 @@ namespace Module
                         {
                             if (functionRunMap[{pid, "FollowTarget"}].load() == false)
                                 return;
-                            std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
+                            std::vector<PrioritizedEntity> _entitys5 = GetEntitysWithPriority(
                                 game,
                                 ex, ey, ez,
                                 130,
@@ -1492,9 +1460,9 @@ namespace Module
                                 _noTargets,
                                 bossLevel);
 
-                            if (!entitys.empty())
+                            if (!_entitys5.empty())
                             {
-                                KillEntitys(pid, entitys, game, ctx, 2000,
+                                KillEntitys(pid, _entitys5, game, ctx, 2000,
                                             std::string(tab + " [[5*]") + name + "]",
                                             e, targets, noTargets);
                                 continue;
@@ -1508,7 +1476,8 @@ namespace Module
 
                             ++emptyStreak;
                         }
-                        LOGF("[5*指定范围已全部清除]id: %s, 优先级: %d",
+                        LOGF("[%02d|%02d][5*指定范围已全部清除]id: %s, 优先级: %d",
+                             idx, total,
                              name.c_str(),
                              pe.priority);
                     }
@@ -1533,6 +1502,8 @@ namespace Module
                 // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
                 MoveUntilReached(game, ex, ey + 1.5f, ez);
             }
+            if (is_continue)
+                continue;
             if (sleepTime != 0 && overEntity.address == 0)
             {
                 if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos)
