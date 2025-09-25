@@ -115,8 +115,6 @@ config := _Config(
             "AppVersion", "20250623102000",
             "Source", "https://github.com/Angels-D/TroveAuto/",
             "Mirror", "https://github.moeyy.xyz/",
-            "StrCrypto", "y(Hn,(}I+2209Zd^s5(E%vfpoKh.I=",
-            "Cheat", "Enter 你的30条命秘籍",
             "Language", _Language.GetLanguage(),
         ),
         "RefreshTime", Map("Value", "3000",),
@@ -141,6 +139,10 @@ config := _Config(
         "Key", Map(
             "Press", "e",
             "Fish", "f",
+        ),
+        "AutoPotion", Map(
+            "MinIntervalMs", "3000",   ; 使用间隔下限（毫秒）；UI 里用秒展示
+            "StopAtCount", "0"       ; 药瓶数量 ≤ 这个值 就不再使用（0 表示无限制）
         ),
         "Address", Map(
             "Animation", "0x74DF95",
@@ -233,6 +235,25 @@ t := ObjBindMethod(language, "Translate")
 config.Load()
 language.SetConfig(config)
 
+; 统一添加 “复选框 + 配置按钮” 的控件
+; 返回 {Check: GuiCtrl, Button: GuiCtrl}
+AddCheckAndButton(guiObj, pos, checkVar, buttonVar, btnText, onClickFn := "") {
+    ; 1) 放一个“无文字”CheckBox
+    cb := guiObj.Add("CheckBox", pos " w18 h18 v" checkVar, "")
+    cb.GetPos(&cx, &cy, &cw, &ch)
+
+    ; 2) 紧跟其后的 Button（和你现有写法一致）
+    btn := guiObj.Add("Button"
+        , Format("x{} y{} w114 h22 +0x100 v{}", cx + cw - 3, cy - 2, buttonVar)
+        , btnText)
+
+    ; 3) 可选绑定点击事件
+    if (onClickFn != "")
+        try btn.OnEvent("Click", onClickFn)
+
+    return Map("Check", cb, "Button", btn)
+}
+
 MainGui := Gui("-DPIScale +Resize +MaxSize HScroll VScroll", t("Trove辅助"))
 MainGui.Add("Tab3", "vTab", [t("主页"), t("面板"), t("其他功能"), t("设置"), t("关于")])
 
@@ -263,7 +284,8 @@ MainGui.Add("CheckBox", "xs Section w140 vAutoBtn_Key_Click_LEFT", t("自动左�
 MainGui.Add("CheckBox", "ys w140 vAutoBtn_Key_Click_RIGHT", t("自动右击"))
 MainGui.Add("CheckBox", "xs Section w200 vAutoBtn_NoTop", t("前台时禁用"))
 MainGui.Add("GroupBox", "xs-10 ys+40 w310 r7.5 Section", t("功能区"))
-for key, value in Map(
+
+featuresMap := Map(
     "Animation", t("隐藏特效"),
     "Attack", t("自动攻击"),
     "BlindMode", t("瞎子模式"),
@@ -279,9 +301,40 @@ for key, value in Map(
     "NoClip", t("穿墙"),
     "UseLog", t("物品栏计数"),
     "Zoom", t("视野放大"),
+    "AutoPotion", t("自动药瓶")  ; ✅ 新增：作为“功能区”一项（复选框）
+    ; "AutoChest", t("自动宝箱")
 )
-    MainGui.Add("CheckBox", (Mod(A_Index, 2) ? ((A_Index == 1 ? "xp+10 yp+30" : "xs") " Section") : "ys") " w140 v" key,
-    value)
+
+; 定义显示顺序（与上面 featuresMap 的键名一致）
+featuresOrder := [
+    "Animation", "Attack", "BlindMode", "Breakblocks", "ByPass", "ClipCam",
+    "Dismount", "Health", "LockCam", "Map", "Mining", "MiningGeode",
+    "NoClip", "UseLog", "Zoom", "AutoPotion"
+]
+
+pairedFeatures := Map(
+    "AutoPotion", Map(
+        "buttonVar", "AutoPotionCfg",
+        "buttonText", t("自动药瓶"),
+        "onClickFn", AutoPotionEdit   ; ← 新增
+    )
+)
+
+for name in featuresOrder {
+    label := featuresMap[name]
+    pos := (Mod(A_Index, 2)
+        ? ((A_Index = 1 ? "xp+10 yp+30" : "xs") " Section")
+        : "ys")
+
+    if pairedFeatures.Has(name) {
+        pf := pairedFeatures[name]
+        ctl := AddCheckAndButton(MainGui, pos, name, pf["buttonVar"], pf["buttonText"], pf["onClickFn"])
+        ; 复选框要绑定 Features（你上次的问题就是没绑这个）
+        ctl["Check"].OnEvent("Click", Features)
+    } else {
+        MainGui.Add("CheckBox", pos " w140 v" name, label)
+    }
+}
 MainGui.Add("GroupBox", "xs-10 ys+40 w310 r4.2 Section", t("跟随目标") "       " t("正则表达式 逗号隔开"))
 MainGui.Add("CheckBox", "xp+80 yp vFollowTarget")
 MainGui.Add("Text", "xs+10 ys+30 Section", t("玩家列表:"))
@@ -475,6 +528,102 @@ Close(thisGui) {
             return true
     }
 }
+
+AutoPotionEdit(*) {
+    ; 读取当前配置（毫秒）
+    curMs := Integer(config.data["AutoPotion"]["MinIntervalMs"])
+    ms := curMs >= 0 ? curMs : 3000
+    stopN := Integer(config.data["AutoPotion"]["StopAtCount"])
+
+    dlg := Gui("-DPIScale +OwnDialogs +Resize +MinSize460x300", t("自动药瓶设置"))
+    dlg.MarginX := 16, dlg.MarginY := 14
+    dlg.SetFont("s10")
+
+    ; 顶部说明
+    dlg.Add("Text", "xm w430 cGray", t("说明：血量减少时会自动使用药品（默认开启，无需额外开关）。"))
+
+    ; ====== Group 1: 使用策略 ======
+    gb1 := dlg.Add("GroupBox", "xm y+8 w430 h96", t("使用策略"))
+    gb1.GetPos(&gx1, &gy1, &gw1, &gh1)
+    ix1 := gx1 + 12, iy1 := gy1 + 28
+
+    ; 行1：使用间隔下限（毫秒）
+    ; —— 使用间隔（毫秒） ——
+    dlg.Add("Text", Format("x{} y{} w210 Right", ix1, iy1), t("使用间隔下限（毫秒）："))
+    dlg.Add("Edit", Format("x{} y{} w120 Number vAP_MinMs", ix1 + 220, iy1 - 3), ms)
+    dlg.Add("UpDown", "Range0-600000 +0x10 +0x80", ms)  ; ✅ +0x10=UDS_AUTOBUDDY, +0x80=UDS_SETBUDDYINT
+
+    ; ====== Group 2: 使用限制 ======
+    gb2 := dlg.Add("GroupBox", "xm y+8 w430 h96", t("使用限制"))
+    gb2.GetPos(&gx2, &gy2, &gw2, &gh2)
+    ix2 := gx2 + 12, iy2 := gy2 + 28
+
+    ; —— 药瓶库存阈值 ——
+    dlg.Add("Text", Format("x{} y{} w210 Right", ix2, iy2), t("药瓶库存 ≤ N 时停止："))
+    dlg.Add("Edit", Format("x{} y{} w120 Number vAP_StopN", ix2 + 220, iy2 - 3), stopN)
+    dlg.Add("UpDown", "Range0-999 +0x10 +0x80", stopN)   ; ✅ 同理
+
+    ; 底部按钮
+    dlg.Add("Button", "xm y+14 w120 vAP_Save", t("保存"))
+    dlg.Add("Button", "x+10 w120 vAP_Cancel", t("取消"))
+
+    dlg["AP_Save"].OnEvent("Click", AutoPotionSave.Bind(dlg))
+    dlg["AP_Cancel"].OnEvent("Click", (*) => dlg.Destroy())
+    dlg.OnEvent("Close", (*) => dlg.Destroy())
+    dlg.Show("AutoSize Center")
+}
+
+AutoPotionSave(dlg, *) {
+    dlg.Submit("NoHide")
+
+    msTxt := ""
+    stopTxt := ""
+
+    try {
+        msTxt := Trim(dlg["AP_MinMs"].Value)
+        logger.info("读取到的间隔文本：" msTxt)
+    } catch {
+        msTxt := ""
+    }
+    try {
+        stopTxt := Trim(dlg["AP_StopN"].Value)
+        logger.info("读取到的停止阈值文本：" stopTxt)
+    } catch {
+        stopTxt := ""
+    }
+
+    ; 解析与兜底
+    msDefault := Integer(config.data["AutoPotion"]["MinIntervalMs"])
+    stopNDefault := Integer(config.data["AutoPotion"]["StopAtCount"])
+
+    ; 处理最小间隔
+    if (msTxt == "") {
+        ms := 3000   ; 默认值
+    } else if (IsNumber(msTxt)) {
+        ms := Integer(msTxt)
+    } else {
+        ms := msDefault   ; 如果既不是空也不是数字，则保持原值
+    }
+
+    ; 处理停止阈值
+    if (stopTxt == "") {
+        stopN := 0   ; 默认值
+    } else if (IsNumber(stopTxt)) {
+        stopN := Integer(stopTxt)
+    } else {
+        stopN := stopNDefault
+    }
+
+    config.data["AutoPotion"]["MinIntervalMs"] := String(ms)
+    config.data["AutoPotion"]["StopAtCount"] := String(stopN)
+    config.Save()
+
+    dlg.Destroy()
+    try logger.info(Format("自动药瓶设置已保存：间隔 {} ms，停止阈值 {}", ms, stopN))
+    UpdateConfig("Module::AutoPotion::minIntervalMs", String(ms))
+    UpdateConfig("Module::AutoPotion::stopAtCount", String(stopN))
+}
+
 GetGamePath(GuiCtrlObj, Info) {
     try {
         GamePathFromReg := () {
@@ -502,6 +651,7 @@ GetGamePath(GuiCtrlObj, Info) {
     } catch
         MsgBox(t("请运行游戏或登陆器以检测路径"))
 }
+
 GameStart(GuiCtrlObj := unset, Info := unset) {
     try Run(Format("{1}\GlyphClient.exe", config.data["Global"]["GamePath"]))
     catch
@@ -540,7 +690,7 @@ UIReset() {
         "AutoBtn_NoTop", "HotKeyBox", "Interval", "SelectAction", "StartBtn", "FollowTarget", "FollowTarget_PlayerName",
         "FollowTarget_TargetName", "FollowTarget_TargetBoss", "FollowTarget_TargetList", "FollowTarget_ScanAll",
         "FollowTarget_BossLevel", "SpeedUp", "SpeedUp_SpeedUpRate", "AutoAim", "AutoAim_AimRange", "AutoAim_TargetBoss",
-        "AutoAim_TargetNormal", "AutoAim_TargetPlant"]
+        "AutoAim_TargetNormal", "AutoAim_TargetPlant", "AutoPotion", "AutoPotionCfg"]
         MainGui[key].Enabled := false
     for key in ["Animation", "Attack", "BlindMode", "Breakblocks", "ByPass", "ClipCam", "Dismount", "Health", "LockCam",
         "Map", "Mining", "MiningGeode", "NoClip", "UseLog", "Zoom", "AutoBtn_Key_Click_LEFT", "AutoBtn_Key_Click_RIGHT",
@@ -595,7 +745,8 @@ Save(GuiCtrlObj := unset, Info := unset) {
         if (InStr(sect, "Language_", true) == 1
         or sect == "Address_Offset"
         or sect == "Features_Change"
-        or sect == "Address_Offset_Signature")
+        or sect == "Address_Offset_Signature"
+        or sect == "AutoPotion")
             continue
         for key in data {
             try {
@@ -701,6 +852,10 @@ SelectAction(GuiCtrlObj, Info := unset) {
             }
         }
     }
+    MainGui["AutoPotion"].Enabled := true
+    try MainGui["AutoPotion"].Value := theGame.setting["Features"]["AutoPotion"]
+    try MainGui["AutoPotionCfg"].Enabled := true
+
     for key in ["Animation", "BlindMode", "Attack", "Breakblocks", "ByPass", "ClipCam", "Dismount", "Health", "LockCam",
         "Map", "Mining", "MiningGeode", "NoClip", "UseLog", "Zoom"] {
         MainGui[key].Enabled := true
@@ -813,7 +968,7 @@ Top_WhichTarget(GuiCtrlObj, Info) {
                     result := StrSplit(StrGet(Mvalue, "utf-8"), ',')
                     if (result.Length >= 7) {
                         A_Clipboard := result[1]
-                        s := Format(t("名称(见剪贴板): {1}`n等级: {2} 血量: {3} 距离: {4}`n坐标(XYZ): {5},{6},{7}"), result[1],
+                        s := Format(t("名称(见剪贴板): {1}等级: {2} 血量: {3} 距离: {4}坐标({5},{6},{7})"), result[1],
                         result[2], result[3], result[4], result[5], result[6], result[7])
                         logger.debug(s)
                         ToolTip(s)
@@ -1353,13 +1508,13 @@ class Game {
         ),
         "AutoBtn", Map(
             "NoTop", false,
-            "interval", "1000",
+            "interval", "10",
             "keys", [
                 Game.Key(false, "Esc", 0, 500),
                 Game.Key(false, "1", 0, 500),
                 Game.Key(false, "2", 0, 500),
                 Game.Key(false, "Q", 0, 500),
-                Game.Key(false, "R", 5000, 500),
+                Game.Key(false, "R", 6000, 500),
                 Game.Key(false, "T", 5000, 500),
                 Game.Key(false, "E", 5000, 500)
             ],
@@ -1377,56 +1532,15 @@ class Game {
             "LockCam", "Map", "Mining", "MiningGeode", "NoClip", "UseLog", "Zoom"]
             this.setting["Features"][key] := false
         this.FeaturesAttackFunc := ObjBindMethod(this, "Features_Attack")
-        this.FeaturesHealthFunc := ObjBindMethod(this, "Features_Health")
+        ; this.HealthMonitorFunc := ObjBindMethod(this, "HealthMonitor")
 
+        this.setting["Features"]["AutoPotion"] := false
         named := Format("<{1}>", this.name)
         if ( not InStr(config.data["TP"]["WhiteList"], named, true)) {
             if (StrLen(config.data["TP"]["WhiteList"]))
                 config.data["TP"]["WhiteList"] .= ","
             config.data["TP"]["WhiteList"] .= named
         }
-    }
-
-    addrPotion := 0
-
-    PotionCount() {
-        ; ① 检查签名
-        if !config.data.Has("Address_Offset_Signature")
-            return ""
-        if !config.data["Address_Offset_Signature"].Has("Use_Q") ; 你配置里叫 Use_Q
-            return ""
-
-        ; ② 解析签名（与作者写法一致）
-        sig := config.data["Address_Offset_Signature"]["Use_Q"]
-        sigParts := StrSplit(RegExReplace(StrReplace(sig, " "), "X|x", "?"), ",")
-        if (sigParts.Length < 2)
-            return ""
-
-        ; ③ 缓存 AOB 命中地址（注意：这里缓存的是“锚点地址”，后面再加不同偏移）
-        if (!this.addrPotion || this.addrPotion = 0x7FFFFFFF) {
-            try {
-                Result := Buffer(1024, 0)
-                size := AobScan(Result, Result.Size, this.pid, sigParts[2], this.BaseAddress, 0x7FFFFFFF, 1)
-                if (!size)
-                    return ""
-                ; 这里就是签名命中的起点 + 你的“第一段数字偏移”（和 UseLog 相同逻辑）
-                this.addrPotion := NumGet(Result, "UInt") + sigParts[1]
-            } catch {
-                return ""
-            }
-        }
-
-        ; ④ 尝试读两种偏移、两种类型：
-        ;    优先 -0x170(= -368)，其次 -0x180(= -384)
-        off := -0x170
-        valD := this.ReadMemory(this.addrPotion + off, "Double", 8)
-        if (valD >= 0 && valD <= 9999) {
-            logger.debug(Format("Potion @{:#X} off={:#X} Double={}", this.addrPotion, off, valD))
-            return Integer(valD)
-        }
-        ; ⑤ 都不命中 → 返回空（保持你接口风格）
-        logger.warn("PotionCount 未命中合规值（可能版本更新或签名偏移不同）")
-        return ""
     }
 
     static Reset() {
@@ -1593,16 +1707,78 @@ class Game {
             StrSplit(config.data["Features_Change"]["Attack"], ",")[2]
         )
     }
-    Features_Health() {
-        if ( not this.ReadMemory(
-            this.GetAddressOffset(
-                this.BaseAddress + config.data["Address"]["Player"]
-                , StrSplit(config.data["Address_Offset"]["Player_Health"], ","))
-            , "Double", 8)) {
-            this.NatualPress(config.data["Key"]["Press"])
-            Sleep(5000)
+
+    HasFeature(name) {
+        try {
+            feats := this.setting["Features"]
+            return feats.Has(name) ? feats[name] : false
+        } catch {
+            return false
         }
     }
+
+    ; HealthMonitor() {
+    ;     static lastHp := -1
+    ;     static lastDrinkTick := 0
+
+    ;     ; ---- 读配置（每次读，保证热更新）----
+    ;     minIntervalMs := Integer(config.data["AutoPotion"]["MinIntervalMs"])  ; 毫秒
+    ;     stopAtCount := Integer(config.data["AutoPotion"]["StopAtCount"])    ; ≤N 则停止
+
+    ;     if !(this.HasFeature("Health") || this.HasFeature("AutoPotion"))
+    ;         return
+
+    ;     ; 1) 读 HP
+    ;     currentHp := this.ReadMemory(
+    ;         this.GetAddressOffset(
+    ;             this.BaseAddress + config.data["Address"]["Player"],
+    ;             StrSplit(config.data["Address_Offset"]["Player_Health"], ",")
+    ;         ), "Double", 8
+    ;     )
+    ;     ; logger.debug(Format("HP={}", currentHp))
+
+    ;     ; 2) 用药逻辑（血量下降触发 + 冷却 + 库存下限）
+    ;     if (this.HasFeature("AutoPotion")) {
+    ;         if (lastHp != -1 && currentHp < lastHp) {
+    ;             now := A_TickCount
+    ;             ; （可选）查询库存；返回 "" 表示读不到
+    ;             ; cnt := this.PotionCount(this.pid, this.BaseAddress, this.ProcessHandle, config.data[
+    ;             ;     "Address_Offset_Signature"]["Use_Q"])
+    ;             cnt := 10
+    ;             ; logger.debug(Format("PotionCount={}", cnt))
+    ;             if (cnt != "" && stopAtCount > 0 && cnt <= stopAtCount) {
+    ;                 logger.warn(Format("药瓶余量 {} ≤ 停止阈值 {}，不再使用。", cnt, stopAtCount))
+    ;             } else if (now - lastDrinkTick >= minIntervalMs) {
+    ;                 this.NatualPress("Q")
+    ;                 lastDrinkTick := now
+    ;                 if (cnt != "")
+    ;                     logger.info(Format("触发自动药瓶（剩余约 {} ）", cnt))
+    ;             } else {
+    ;                 ; 冷却中，不喝
+    ;                 ; logger.trace("药瓶处于冷却中，跳过")
+    ;             }
+    ;         }
+    ;     }
+
+    ;     ; 3) 复活逻辑
+    ;     if (this.HasFeature("Health")) {
+    ;         if (currentHp <= 0) {
+    ;             ; 确保 DLL 的 SetAutoRespawn 已经在跑（避免重复启动，跑着就行）
+    ;             if (!this.threads.Has("AutoRespawn")) {
+    ;                 this.threads["AutoRespawn"] := Map("STOP", false)
+    ;                 ; delay=50ms 可调，你 DLL 里默认 50 也行
+    ;                 FunctionOn(this.pid, "SetAutoRespawn", "50", false)
+    ;                 logger.info("已通知 DLL：监控自动复活(SetAutoRespawn)")
+    ;             }
+    ;             ; 等待 DLL 回调 EVT_RESP_CAN_REVIVE 后，AhkEventSink 会自动按键
+    ;             return
+    ;         }
+    ;     }
+
+    ;     ; 4) 更新 lastHp
+    ;     lastHp := currentHp
+    ; }
+
     Features(Name, Value) {
         switch Name {
             case "Attack":
@@ -1614,8 +1790,25 @@ class Game {
                 this.WriteMemory(this.GetAddressOffset(address, offsets), Value ? 0 : 210, false, "Float", 4)
                 return
             case "Health":
-                SetTimer(this.FeaturesHealthFunc, Value ? config.data["HealthTime"]["Value"] : 0)
+                if (Value) {
+                    FunctionOn(this.pid, "SetAutoRespawn", "100", false) ; 100ms 采样
+                } else {
+                    FunctionOff(this.pid, "SetAutoRespawn")
+                }
                 return
+            case "AutoPotion":
+                ; 开 = 起线程；关 = 停线程
+                if (Value) {
+                    ; 取 UI/INI 里的参数作为 argv
+                    ms := Integer(config.data["AutoPotion"]["MinIntervalMs"])
+                    stop := Integer(config.data["AutoPotion"]["StopAtCount"])
+                    ; 可选第三个参数：采样延迟，给个 50ms
+                    FunctionOn(this.pid, "SetAutoPotion", Format("{}|{}|{}", ms, stop, 50), false)
+                } else {
+                    FunctionOff(this.pid, "SetAutoPotion")
+                }
+                return
+
             case "NoClip":
                 FunctionOn(this.pid, "SetNoClip", String(Value), true)
                 return
@@ -1671,6 +1864,44 @@ class Game {
         }
     }
 }
+
+; DLL→AHK 事件回调：两个参数 (uint evtId, char* payload)
+AhkEventSink(evtId, pMsg) {
+    payload := ""
+    try payload := StrGet(pMsg, "UTF-8")
+    parts := StrSplit(payload, "|")
+    pid := parts.Length >= 1 ? Integer(parts[1]) : 0
+    src := parts.Length >= 2 ? parts[2] : ""
+
+    ; 找到对应 Game（按 pid 路由）
+    targetGame := ""
+    for name, g in Game.Lists {
+        if (g.pid = pid) {
+            targetGame := g
+            break
+        }
+    }
+    if (!IsSet(targetGame) || !targetGame) {
+        logger.warn(Format("事件 {}, 但未找到 pid={} 的实例", evtId, pid))
+        return
+    }
+
+    if (evtId = 1001) {  ; EVT_RESP_CAN_REVIVE
+        if (targetGame.HasFeature("Health")) {
+            targetGame.NatualPress(config.data["Key"]["Press"]) ; 复活键（你配置里是Press=E）
+            ; logger.info(Format("自动复活：来源={} -> 按 {}", src, config.data["Key"]["Press"]))
+        }
+    } else if (evtId = 1002) { ; EVT_USE_POTION
+        if (targetGame.HasFeature("AutoPotion")) {
+            targetGame.NatualPress("Q")  ; 你的设计：药水就是Q
+            ; logger.info(Format("自动药水：来源={} -> 按 Q", src))
+        }
+    }
+}
+
+; 注册回调
+global g_AhkEvtCb := CallbackCreate(AhkEventSink, , 2)
+DllCall("Module\SetAhkEventCallbackA", "Ptr", g_AhkEvtCb)
 
 Reset()
 DirCreate("logs")

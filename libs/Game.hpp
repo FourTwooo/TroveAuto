@@ -18,8 +18,7 @@
 #define _GAME_HPP_
 
 #include "Memory.hpp"
-#include <windows.h>   // ← 在这里加
-
+#include <windows.h> // ← 在这里加
 
 template <typename T = Memory::Address>
 class Object : public Memory
@@ -30,7 +29,7 @@ public:
     typedef std::pair<int32_t, std::string> Signature;
 
     Object(const DWORD &pid, const Offsets &offsets = {}, const Signature &signature = {});
-    template<typename N>
+    template <typename N>
     Object(const Object<N> &obj, const Offsets &offsets = {}, const Signature &signature = {});
 
     operator T() const;
@@ -129,7 +128,6 @@ public:
             Entity &UpdateAddress();
             Entity &UpdateData();
             bool CheckData();
-
         };
 
         struct Data
@@ -254,19 +252,25 @@ public:
 
     struct Data
     {
+        static Offsets worldIdOffsets;
         Player player;
         World world;
     } data;
 
+    Object<uint64_t> worldId; // 新增：世界ID对象
+
 public:
     Game(const DWORD &pid);
     Game &UpdateAddress(const DWORD &pid = 0);
+    Game &UpdateData();
 };
 
 // Game.cpp
 
 std::string Game::moduleName = "Trove.exe";
 Game::Signature Game::World::signature = {10, "55 8B EC 83 7D 08 04 75 10 A1 XX XX XX XX 85 C0 74 07 C6 80 59 01 00 00 01 5D C2 04 00"};
+// 世界ID的偏移量
+Memory::Offsets worldIdOffsets = {0x0109E530, 0x60};
 Memory::Offsets Game::World::offsets = {0x109E574, 0x0};
 Memory::Offsets Game::World::Data::playerCountOffsets = {0xFC, 0x2C};
 Memory::Offsets Game::World::NodeInfo::offsets = {0x7C};
@@ -733,7 +737,12 @@ Game::Player &Game::Player::UpdateData()
 }
 
 Game::Game(const DWORD &pid)
-    : Object(pid), data({{*this}, {*this}})
+    : Object(pid),
+      data{
+          {*this}, // player
+          {*this}  // world
+      },
+      worldId(pid, worldIdOffsets) // 新增：初始化世界ID对象
 {
     baseAddress = GetModuleAddress(moduleName);
 }
@@ -744,7 +753,15 @@ Game &Game::UpdateAddress(const DWORD &pid)
     UpdateBaseAddress(GetModuleAddress(moduleName));
     data.world.UpdateBaseAddress(baseAddress);
     data.player.UpdateBaseAddress(baseAddress);
+    worldId.UpdateBaseAddress(baseAddress);
     return *this;
 }
 
+Game &Game::UpdateData()
+{
+    data.world.UpdateData();
+    data.player.UpdateData();
+    worldId.UpdateAddress().UpdateData(); // 新增：更新世界ID
+    return *this;
+}
 #endif

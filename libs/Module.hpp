@@ -117,6 +117,34 @@ auto createRegexVector = [](const auto &strings)
     }
     return result;
 };
+// ===== AHK event bridge (回调) =====
+extern "C"
+{
+    typedef void(__stdcall *AhkEventCallbackA)(unsigned evtId, const char *payload);
+    __declspec(dllexport) void __stdcall SetAhkEventCallbackA(AhkEventCallbackA cb);
+}
+
+// 事件ID定义（你也可以放到头文件里统一管理）
+enum : unsigned
+{
+    EVT_RESP_CAN_REVIVE = 1001, // AHK去按“复活键”
+    EVT_USE_POTION = 1002,      // AHK去按“药水键Q”
+};
+
+namespace AhkEvt
+{
+    static AhkEventCallbackA g_cbA = nullptr;
+    inline void Emit(unsigned id, const char *msg)
+    {
+        if (g_cbA)
+            g_cbA(id, msg ? msg : "");
+    }
+}
+
+extern "C" void __stdcall SetAhkEventCallbackA(AhkEventCallbackA cb)
+{
+    AhkEvt::g_cbA = cb;
+}
 
 // ===== AHK log bridge (回调) =====
 extern "C"
@@ -287,12 +315,21 @@ namespace Module
     std::vector<std::string> timeOutIds = {};
 
     // ===== 新增：扫图参数 & 状态 =====
-    static uint32_t realisticScanRange = 300;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
+    static uint32_t realisticScanRange = 3000;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
     static std::unordered_set<std::string> switchIds = { // NEW: “开关ID”列表（仅作名称/关键词匹配）
         "quest_spawn_trigger_fivestar_depths", "quest_spawn_trigger_fivestar"};
 
     // 全局死亡标记
-    static std::atomic<bool> isPlayerDead{false}; // NEW
+    // static std::atomic<bool> isPlayerDead{false}; // NEW
+    // static std::atomic<bool> respawnNotified{false};
+
+    // NEW：AutoPotion 开关&参数（默认同你 AHK：3000ms，stopAtCount=0 表示忽略库存）
+    static std::atomic<bool> autoPotionEnabled{false};
+    static std::atomic<uint32_t> apMinIntervalMs{3000};
+    static std::atomic<uint32_t> apStopAtCount{0}; // 你暂时不做库存判定，可先不使用
+
+    // NEW：AutoRespawn 开关（Health 开启时置 true）
+    static std::atomic<bool> autoRespawnEnabled{false};
 
     // 深渊宝箱黑名单存放
     static std::deque<std::tuple<float, float, float>> blacklistedChests;
@@ -375,10 +412,7 @@ namespace Module
          {"Game::Player::Fish::Data::lavaStatusOffsets", &Game::Player::Fish::Data::lavaStatusOffsets},
          {"Game::Player::Fish::Data::chocoStatusOffsets", &Game::Player::Fish::Data::chocoStatusOffsets},
          {"Game::Player::Fish::Data::plasmaStatusOffsets", &Game::Player::Fish::Data::plasmaStatusOffsets},
-         {"Game::Player::Bag::offset", &Game::Player::Bag::offsets},
-         // NEW: 让这些键可被 UpdateConfig 识别
-         {"Module::SwitchIds", &Module::switchIds},
-         {"Module::realisticScanRange", &Module::realisticScanRange}};
+         {"Game::Player::Bag::offset", &Game::Player::Bag::offsets}};
 
     static std::map<std::pair<int, std::string>, std::atomic<bool>> functionRunMap;
 
@@ -398,15 +432,6 @@ namespace Module
     std::unique_ptr<Game::World::Entity> FindTarget(Game &game, const bool &targetBoss = true, const bool &targetPlant = false, const bool &targetNormal = false, const std::vector<std::string> &targets = {}, const std::vector<std::string> &noTargets = {}, const uint32_t &range = 45);
 
     void GetNextPoint(float &x, float &z, std::unordered_set<std::string> &visitedPoints);
-
-    // NEW: 名字里如果包含任一 switchId，就认为是“开关”
-    inline bool IsSwitchName(const std::string &name)
-    {
-        for (const auto &k : Module::switchIds)
-            if (!k.empty() && name.find(k) != std::string::npos)
-                return true;
-        return false;
-    }
 
     inline bool Arrived2D(Game &game, float tx, float tz, float eps = 1.0f)
     {
@@ -585,23 +610,99 @@ namespace Module
         }
     }
 
+    bool AutoRespawn(const Memory::DWORD &pid, bool is_respawn)
+    {
+        Game game(pid);
+        game.UpdateAddress().data.player.UpdateAddress();
+        double hp = game.data.player.data.health
+                        .UpdateAddress()
+                        .UpdateData()
+                        .data;
+        if (hp <= 0.0)
+        {
+            if (is_respawn)
+            {
+                char buf[64];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%lu|%s", (unsigned long)pid, "byFollow");
+                AhkEvt::Emit(EVT_RESP_CAN_REVIVE, buf);
+            }
+            return true;
+        }
+        return false;
+    }
+
     void SetAutoRespawn(const Memory::DWORD &pid, const uint32_t &delay)
     {
         Game game(pid);
         game.UpdateAddress().data.player.UpdateAddress();
-        while (functionRunMap[{pid, "SetAutoRespawn"}].load()) // CHANGED: 独立控制
+
+        const uint32_t tick = delay ? delay : 50;
+
+        while (functionRunMap[{pid, "SetAutoRespawn"}].load())
         {
-            bool dead = (game.data.player.data.health.UpdateAddress().UpdateData().data == 0);
-            Module::isPlayerDead.store(dead);
-            LOGF("[自动复活] dead=%d", dead);
-            if (dead)
+            double hp = game.data.player.data.health
+                            .UpdateAddress()
+                            .UpdateData()
+                            .data;
+
+            if (hp <= 0.0 && !(functionRunMap[{pid, "FollowTarget"}].load()))
             {
-                // TODO: 这里可补“模拟按键E”复活
-                // e.g. SendInput / PostMessage / WriteMemory...
-                // 当前保留未完工标记
+                // 跟随中 → byFollow；否则 → now
+                bool following = functionRunMap[{pid, "FollowTarget"}].load();
+                char buf[64];
+                _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%lu|%s",
+                            (unsigned long)pid, "now");
+                AhkEvt::Emit(EVT_RESP_CAN_REVIVE, buf);
+
+                // 不用任何标记，简单节流一下，避免每 tick 都狂发
+                std::this_thread::sleep_for(std::chrono::milliseconds(following ? 5000 : 200));
+                continue; // 继续下一轮检测
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+            std::this_thread::sleep_for(std::chrono::milliseconds(tick));
+        }
+    }
+
+    // 纯本地状态变量（线程内）
+    void SetAutoPotion(const Memory::DWORD &pid,
+                       uint32_t minIntervalMs,
+                       uint32_t stopAtCount /* 先留参数位，库存判定你后面要用也行 */,
+                       uint32_t delay /* 采样间隔，默认 50ms */)
+    {
+        Game game(pid);
+        game.UpdateAddress().data.player.UpdateAddress();
+
+        double lastHp = -1.0;
+        auto lastDrink = std::chrono::steady_clock::now() - std::chrono::hours(1);
+
+        const uint32_t tick = delay ? delay : 50;
+
+        while (functionRunMap[{pid, "SetAutoPotion"}].load())
+        {
+            // 采 HP
+            double hp = game.data.player.data.health
+                            .UpdateAddress()
+                            .UpdateData()
+                            .data;
+
+            // HP 下降触发
+            if (lastHp >= 0.0 && hp < lastHp)
+            {
+                auto now = std::chrono::steady_clock::now();
+                auto diff = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastDrink).count();
+                if (diff >= (int)minIntervalMs)
+                {
+                    // 通知 AHK 去按 Q
+                    char buf[64];
+                    _snprintf_s(buf, sizeof(buf), _TRUNCATE, "%lu|hp_drop", (unsigned long)pid);
+                    AhkEvt::Emit(EVT_USE_POTION, buf);
+                    lastDrink = now;
+                    // LOGF("[AutoPotion] %.3f -> %.3f, emit EVT_USE_POTION", lastHp, hp);
+                }
+            }
+
+            lastHp = hp;
+            std::this_thread::sleep_for(std::chrono::milliseconds(tick));
         }
     }
 
@@ -890,9 +991,13 @@ namespace Module
                 }
 
                 // 如果设置了以Boss为目标，并且（实体等级达到Boss级别或名称包含"boss"）
-                if (targetBoss || std::regex_match(name, std::regex(".*boss.*")))
+                if (targetBoss)
                 {
-                    priority += 600;
+                    priority += 200;
+                    if (std::regex_match(name, std::regex(".*boss.*")))
+                    {
+                        priority += 400;
+                    }
                 }
 
                 // 如果设置了以普通实体为目标
@@ -1027,7 +1132,10 @@ namespace Module
 
         // 创建Game对象，用于与游戏进程交互
         Game game(pid);
-
+        // game.UpdateAddress();
+        // game.UpdateData(); // 使用新的方法名
+        // uint64_t worldId = game.worldId.data;
+        // LOGF("[当前世界ID] => %d", worldId);
         Game::World::Entity e(static_cast<Object<> &>(game));
         e.address = 0;
 
@@ -1073,12 +1181,43 @@ namespace Module
 
         while (functionRunMap[{pid, "FollowTarget"}].load())
         {
+
+            if (functionRunMap[{pid, "SetAutoRespawn"}].load())
+            {
+                if (AutoRespawn(pid, true))
+                {
+                    LOGW("[玩家死亡] 等待复活...");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(5000));
+                    continue;
+                }
+            }
+
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
             // 更新游戏基址和玩家地址信息
             game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
             ax = game.data.player.data.coord.data.x.UpdateData().data;
             ay = game.data.player.data.coord.data.y.UpdateData().data;
             az = game.data.player.data.coord.data.z.UpdateData().data;
+
+            if (!players.empty())
+            {
+                std::unique_ptr<Game::World::Player> player = nullptr;
+                game.data.player.data.coord.UpdateAddress();        // 更新坐标结构地址
+                game.data.player.data.coord.data.x.UpdateAddress(); // 更新X坐标地址
+                game.data.player.data.coord.data.y.UpdateAddress(); // 更新Y坐标地址
+                game.data.player.data.coord.data.z.UpdateAddress(); // 更新Z坐标地址
+
+                player = FindPlayer(game, players);
+                if (player)
+                {
+                    float playerX = player->data.x.UpdateAddress().UpdateData().data;
+                    float playerY = player->data.y.UpdateAddress().UpdateData().data;
+                    float playerZ = player->data.z.UpdateAddress().UpdateData().data;
+                    MoveEvent(playerX, playerY, playerZ);
+                    continue;
+                }
+            }
+
             // 获取与自己距离最近的实体列表
             std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
                 game,
@@ -1107,11 +1246,7 @@ namespace Module
                         hasGoal = true;
                         LOGF("[初始启动扫描无名单开始移动] => (%.0f, %.0f)", targetX, targetZ); // 只在这里打
                     }
-                    // MoveEvent(game, mv, targetX, ty, targetZ);
-                    // 每帧朝格心推进：用“你已有的” MoveEvent
-                    // float ty = std::clamp(game.data.player.data.coord.data.y.UpdateAddress().UpdateData().data, Module::minY, Module::maxY);
-                    // MoveEvent(game, mv, targetX, ty, targetZ);
-                    // MoveUntilReached(game, targetX, ty, targetZ);
+
                     MoveEvent(targetX, targetY = std::clamp((std::max)(targetY, game.data.player.data.coord.data.y.UpdateData().data), minY, maxY), targetZ);
                     // 到达格心 → 再取下一格
                     if (Module::Arrived2D(game, targetX, targetZ, 1.0f))
@@ -1127,7 +1262,7 @@ namespace Module
             else
             {
                 // 清理逻辑
-                KillEntitys(pid, entitys, game, mv, 2000, "", e, targets, noTargets);
+                KillEntitys(pid, entitys, game, mv, 500, "", e, targets, noTargets);
             }
         }
     }
@@ -1211,6 +1346,61 @@ namespace Module
                 if (functionRunMap[{pid, "FollowTarget"}].load() == false)
                     return;
 
+                if (functionRunMap[{pid, "SetAutoRespawn"}].load())
+                {
+                    game.UpdateAddress().data.player.UpdateAddress();
+                    double hp = game.data.player.data.health
+                                    .UpdateAddress()
+                                    .UpdateData()
+                                    .data;
+                    if (hp <= 0.0)
+                    {
+                        if (tab != "")
+                        {
+                            LOGW("[玩家死亡] 优先退出多层方法嵌套");
+                            return;
+                        }
+                        if (AutoRespawn(pid, false))
+                        {
+                            LOGW("[玩家死亡] 退出待清理名单, 等待复活...");
+                            return;
+                        }
+                    }
+                }
+
+                entity.UpdateAddress().UpdateData();
+                // ★ 每圈刷新：地址 & 名字
+                uintptr_t addr = (uintptr_t)entity.address;
+                name = entity.data.name.UpdateData(128).data;
+                float ex = entity.data.x.UpdateData().data;
+                float ey = entity.data.y.UpdateData().data;
+                float ez = entity.data.z.UpdateData().data;
+                // ★ 用“地址+tab”做复合键，避免递归时同地址被抑制
+                uint64_t pkey = makeKey(addr, name, tab);
+
+                if (IsEmptyId(name))
+                {
+                    // LOGF("[空ID]优先级: %d, 等级:%u, 坐标(%.2f, %.2f, %.2f), 已跳过",
+                    //      pe.priority,
+                    //      entity.data.level.UpdateAddress().UpdateData().data,
+                    //      ex, ey, ez);
+                    printed.erase(pkey);
+                    // is_continue = true;
+                    break; // 遇到空ID就跳过
+                }
+
+                if (entity.data.isDeath.UpdateAddress().UpdateData().data == 0 || !EntityStillExists(game, entity))
+                {
+                    std::string TAB = std::string("[已消失]" + tab + " => ");
+                    LOGF("[%02d|%02d]%sid: %s, 优先级: %d",
+                         idx, total,
+                         TAB.c_str(),
+                         name.c_str(),
+                         pe.priority);
+                    printed.erase(pkey);
+                    break;
+                }
+
                 if (name != pe.name)
                 {
                     if (isDevTools)
@@ -1231,11 +1421,24 @@ namespace Module
                         return;
                     }
                 }
+
                 // 超时保护：超时则退出该目标
                 const auto now = std::chrono::steady_clock::now();
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - t0).count();
                 if (elapsed >= timeoutMs)
                 {
+                    is_continue = true;
+                    game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                    float ax = game.data.player.data.coord.data.x.UpdateData().data;
+                    float ay = game.data.player.data.coord.data.y.UpdateData().data;
+                    float az = game.data.player.data.coord.data.z.UpdateData().data;
+                    float currentDist = CalculateDistance(ax, ay, az, ex, ey, ez);
+                    if (currentDist >= 5.0f)
+                    {
+                        LOGW("[%02d|%02d][警告超时退出] => id:%s, 在%.1fS内无法接近名单.目标距离过远(%.2fm) 疑似穿墙/绕过功能失效?", idx, total, name.c_str(), elapsed / 1000.0, currentDist);
+                        break;
+                    }
+
                     std::vector<std::regex> targetRegexs = createRegexVector(targets);
                     // 检查实体是否在黑名单中（使用正则表达式匹配）
                     bool is_targets = false;
@@ -1258,17 +1461,9 @@ namespace Module
                         LOGE("[%02d|%02d][超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [已拉入本次运行临时黑名单. 如需匹配请重启软件]",
                              idx, total, name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
                     }
-                    is_continue = true;
+
                     break;
                 }
-                entity.UpdateAddress().UpdateData();
-                // ★ 每圈刷新：地址 & 名字
-                uintptr_t addr = (uintptr_t)entity.address;
-                name = entity.data.name.UpdateData(128).data;
-
-                float ex = entity.data.x.UpdateData().data;
-                float ey = entity.data.y.UpdateData().data;
-                float ez = entity.data.z.UpdateData().data;
 
                 if (IsSentinelXYZ(ex, ey, ez, /*eps=*/5.f))
                 {
@@ -1281,19 +1476,6 @@ namespace Module
                     break; // 遇到哨兵坐标就跳过
                 }
 
-                // ★ 用“地址+tab”做复合键，避免递归时同地址被抑制
-                uint64_t pkey = makeKey(addr, name, tab);
-
-                if (IsEmptyId(name))
-                {
-                    // LOGF("[空ID]优先级: %d, 等级:%u, 坐标(%.2f, %.2f, %.2f), 已跳过",
-                    //      pe.priority,
-                    //      entity.data.level.UpdateAddress().UpdateData().data,
-                    //      ex, ey, ez);
-                    printed.erase(pkey);
-                    is_continue = true;
-                    break; // 遇到空ID就跳过
-                }
                 // 进入该目标时打印一次
                 if (printed.insert(pkey).second)
                 {
@@ -1323,23 +1505,13 @@ namespace Module
                     }
                 }
 
-                if (entity.data.isDeath.UpdateAddress().UpdateData().data == 0 || !EntityStillExists(game, entity))
-                {
-                    std::string TAB = std::string("[已消失]" + tab + " => ");
-                    LOGF("[%02d|%02d]%sid: %s, 优先级: %d",
-                         idx, total,
-                         TAB.c_str(),
-                         name.c_str(),
-                         pe.priority);
-                    printed.erase(pkey);
-                    break;
-                }
-
                 if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos)
                 {
                     auto chestStartTime = std::chrono::steady_clock::now();
                     while (BlackListed(ex, ez) == false)
                     {
+                        if (functionRunMap[{pid, "FollowTarget"}].load() == false)
+                            return;
                         // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
                         MoveUntilReached(game, ex, ey + 1.5f, ez);
                         game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
@@ -1389,7 +1561,6 @@ namespace Module
                                 std::this_thread::sleep_for(std::chrono::milliseconds(1000));
                                 break;
                             }
-                            // MoveEvent(game, ctx, ex, ey, ez);
                             MoveUntilReached(game, ex, ey, ez);
                         }
                         _noTargets.emplace_back("quest_assault_trigger");
@@ -1397,7 +1568,7 @@ namespace Module
                         std::vector<PrioritizedEntity> _entitys = GetEntitysWithPriority(
                             game,
                             ex, ey, ez,
-                            10,
+                            15,
                             true,
                             false,
                             true,
@@ -1463,6 +1634,15 @@ namespace Module
                         {
                             if (functionRunMap[{pid, "FollowTarget"}].load() == false)
                                 return;
+                            if (functionRunMap[{pid, "SetAutoRespawn"}].load())
+                            {
+                                if (AutoRespawn(pid, false))
+                                {
+
+                                    LOGW("[玩家死亡] 退出5*副本...");
+                                    return;
+                                }
+                            }
                             std::vector<PrioritizedEntity> _entitys5 = GetEntitysWithPriority(
                                 game,
                                 ex, ey, ez,
@@ -1476,9 +1656,10 @@ namespace Module
 
                             if (!_entitys5.empty())
                             {
-                                KillEntitys(pid, _entitys5, game, ctx, 2000,
+                                KillEntitys(pid, _entitys5, game, ctx, 500,
                                             std::string(tab + " [[5*]") + name + "]",
                                             e, targets, noTargets);
+                                emptyStreak = 0;
                                 continue;
                             }
                             else
@@ -1517,7 +1698,13 @@ namespace Module
                 MoveUntilReached(game, ex, ey + 1.5f, ez);
             }
             if (is_continue)
+            {
+                if (isDevTools)
+                {
+                    LOGW("[跳过目标] id:%s", name.c_str());
+                }
                 continue;
+            }
             if (sleepTime != 0 && overEntity.address == 0)
             {
                 if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos)
@@ -1869,23 +2056,6 @@ void UpdateConfig(const char *key, const char *value)
             feature->signature.second = signature[1];
         }
     }
-    // NEW: “开关ID”列表，形如：UpdateConfig("Module::SwitchIds","开关1|开关2|开关3")
-    else if (_key == "Module::SwitchIds")
-    {
-        auto *ids = reinterpret_cast<std::unordered_set<std::string> *>(Module::configMap[_key]);
-        ids->clear();
-        for (auto &s : _value)
-        {
-            auto t = trim(s);
-            if (!t.empty())
-                ids->insert(t);
-        }
-    }
-    // NEW: 真实扫描半径（米）：UpdateConfig("Module::realisticScanRange","90")
-    else if (_value.size() >= 1 && _key == "Module::realisticScanRange")
-    {
-        Module::realisticScanRange = std::stoul(_value[0]);
-    }
 }
 
 void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv, const bool waiting)
@@ -1938,6 +2108,8 @@ void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv, 
         thread = new std::thread(Module::SetAutoAttack, pid, std::stoul(_argv[0]), std::stoul(_argv[1]));
     else if (std::strcmp(funtion, "SetAutoRespawn") == 0)
         thread = new std::thread(Module::SetAutoRespawn, pid, std::stoul(_argv[0]));
+    else if (std::strcmp(funtion, "SetAutoPotion") == 0)
+        thread = new std::thread(Module::SetAutoPotion, pid, std::stoul(_argv[0]), std::stoul(_argv[1]), std::stoul(_argv[2]));
     else if (std::strcmp(funtion, "SetHideAnimation") == 0)
         thread = new std::thread(Module::SetFeature, Module::Feature::hideAnimation, pid, std::stoul(_argv[0]));
     else if (std::strcmp(funtion, "SetBreakBlocks") == 0)
