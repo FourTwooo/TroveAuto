@@ -308,14 +308,14 @@ namespace Module
     static uint32_t tpStep = 4;
     static uint32_t mapWidth = 4300;
     static uint32_t entityScand = 100;
-    static float maxY = 400, minY = -45;
+    static float maxY = 250, minY = -45;
     static std::pair<float, float> aimOffset = {1.25, 0.25};
 
     // 短暂黑名单
     std::vector<std::string> timeOutIds = {};
 
     // ===== 新增：扫图参数 & 状态 =====
-    static uint32_t realisticScanRange = 3000;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
+    static uint32_t realisticScanRange = 300;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
     static std::unordered_set<std::string> switchIds = { // NEW: “开关ID”列表（仅作名称/关键词匹配）
         "quest_spawn_trigger_fivestar_depths", "quest_spawn_trigger_fivestar"};
 
@@ -855,7 +855,7 @@ namespace Module
         "gameplay/chest_quest_standard_small",    // 标准小宝箱
         "gameplay/chest_quest_geode_5star_large", // 深渊大宝箱
         "gameplay/chest_quest_geode_5star_small", // 深渊小宝箱
-        "chest_quest_recipe.*"                    // 配方宝箱
+        ".*chest_quest_recipe.*"                  // 配方宝箱
     };
 
     static const std::vector<std::string> ButtonStarts = {
@@ -965,8 +965,9 @@ namespace Module
 
                 for (const auto &chest : priorityChests)
                 {
-                    // 如果实体名称包含优先宝箱的关键字
-                    if (name.find(chest) != std::string::npos)
+                    // 使用正则表达式匹配宝箱类型
+                    std::regex chestRegex(chest);
+                    if (std::regex_search(name, chestRegex))
                     {
                         priority += 1000;
                     }
@@ -1236,21 +1237,58 @@ namespace Module
                 {
                     if (!hasGoal)
                     {
-                        targetX = game.data.player.data.coord.data.x.UpdateData().data;
-                        targetZ = game.data.player.data.coord.data.z.UpdateData().data;
+                        game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                        float currentX = game.data.player.data.coord.data.x.UpdateData().data;
+                        float currentZ = game.data.player.data.coord.data.z.UpdateData().data;
+
+                        // 检查是否在扫描范围内
+                        float distFromOrigin = std::sqrt(currentX * currentX + currentZ * currentZ);
+                        if (distFromOrigin > mapWidth)
+                        {
+                            // 不在扫描范围内，先移动到原点附近
+                            targetX = 0;
+                            targetZ = 0;
+                            LOGF("[玩家位置超出扫描范围] 先移动到原点附近: (%.0f,%.0f) -> (0,0)", currentX, currentZ);
+                        }
+                        else
+                        {
+                            // 在扫描范围内，从当前位置开始
+                            targetX = currentX;
+                            targetZ = currentZ;
+                        }
+
+                        // 确保当前位置在 visitedPoints 中
+                        auto getKey = [](float x, float z)
+                        {
+                            return std::to_string(static_cast<int>(std::round(x))) + "|" +
+                                   std::to_string(static_cast<int>(std::round(z)));
+                        };
+                        visitedPoints.insert(getKey(targetX, targetZ));
+
                         // 扫图逻辑
-                        GetNextPoint(
-                            targetX,
-                            targetZ,
-                            visitedPoints);
+                        GetNextPoint(targetX, targetZ, visitedPoints);
                         hasGoal = true;
-                        LOGF("[初始启动扫描无名单开始移动] => (%.0f, %.0f)", targetX, targetZ); // 只在这里打
+                        LOGF("[初始启动扫描] => (%.0f, %.0f)", targetX, targetZ);
                     }
+                    // if (!hasGoal)
+                    // {
+                    //     game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                    //     targetX = game.data.player.data.coord.data.x.UpdateData().data;
+                    //     targetZ = game.data.player.data.coord.data.z.UpdateData().data;
+                    //     // 扫图逻辑
+                    //     GetNextPoint(
+                    //         targetX,
+                    //         targetZ,
+                    //         visitedPoints);
+                    //     hasGoal = true;
+                    //     LOGF("[初始启动扫描无名单开始移动] => (%.0f, %.0f)", targetX, targetZ); // 只在这里打
+                    // }
 
                     MoveEvent(targetX, targetY = std::clamp((std::max)(targetY, game.data.player.data.coord.data.y.UpdateData().data), minY, maxY), targetZ);
                     // 到达格心 → 再取下一格
                     if (Module::Arrived2D(game, targetX, targetZ, 1.0f))
                     {
+                        game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
                         targetX = game.data.player.data.coord.data.x.UpdateData().data;
                         targetZ = game.data.player.data.coord.data.z.UpdateData().data;
                         GetNextPoint(targetX, targetZ, visitedPoints);
@@ -1713,7 +1751,7 @@ namespace Module
                 }
 
                 using clock = std::chrono::steady_clock;
-                const auto deadline = clock::now() + std::chrono::milliseconds(2000);
+                const auto deadline = clock::now() + std::chrono::milliseconds(sleepTime);
                 const auto tick = std::chrono::milliseconds(120); // 轮询步长(可调)
 
                 std::vector<PrioritizedEntity> chestList;
@@ -1730,27 +1768,27 @@ namespace Module
                     chestList = GetEntitysWithPriority(
                         game,
                         lx, ly, lz,
-                        /*range=*/10,
+                        /*range=*/25,
                         /*targetBoss=*/false,
                         /*targetPlant=*/false,
                         /*targetNormal=*/false,
                         priorityChests, nr,
                         /*paramBossLevel=*/1);
 
-                    // 只保留优先宝箱三类
-                    chestList.erase(
-                        std::remove_if(
-                            chestList.begin(), chestList.end(),
-                            [&](PrioritizedEntity &pe)
-                            {
-                                std::string nm = pe.entity.data.name.UpdateData(128).data;
-                                bool isPriorityChest = std::any_of(
-                                    priorityChests.begin(), priorityChests.end(),
-                                    [&](const std::string &key)
-                                    { return !key.empty() && nm.find(key) != std::string::npos; });
-                                return !isPriorityChest;
-                            }),
-                        chestList.end());
+                    // // 只保留优先宝箱三类
+                    // chestList.erase(
+                    //     std::remove_if(
+                    //         chestList.begin(), chestList.end(),
+                    //         [&](PrioritizedEntity &pe)
+                    //         {
+                    //             std::string nm = pe.entity.data.name.UpdateData(128).data;
+                    //             bool isPriorityChest = std::any_of(
+                    //                 priorityChests.begin(), priorityChests.end(),
+                    //                 [&](const std::string &key)
+                    //                 { return !key.empty() && nm.find(key) != std::string::npos; });
+                    //             return !isPriorityChest;
+                    //         }),
+                    //     chestList.end());
 
                     if (!chestList.empty())
                     {

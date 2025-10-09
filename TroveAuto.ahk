@@ -775,7 +775,79 @@ Save(GuiCtrlObj := unset, Info := unset) {
     config.Save()
     config.UpdateDllConfig()
 }
+; 获取URL响应内容 - 改进版本
+GetUrlResponse(url, timeout := 10000) {
+    try {
+        ; 创建HTTP请求对象
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+
+        ; 设置超时（毫秒）
+        http.SetTimeouts(timeout, timeout, timeout, timeout)
+
+        ; 打开连接
+        http.Open("GET", url, false)
+
+        ; 设置一些常见的请求头
+        http.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        http.SetRequestHeader("Accept", "*/*")
+
+        ; 发送请求
+        http.Send()
+
+        ; 检查状态码
+        status := http.Status
+        if (status == 200) {
+            return http.ResponseText
+        } else {
+            throw Error("HTTP错误: " status " - " http.StatusText)
+        }
+    }
+    catch as e {
+        ; 更详细的错误信息
+        errorMsg := "请求失败: " e.Message " (错误码: " Format("0x{:X}", e.Extra) ")"
+        logger.err(errorMsg)
+
+        ; 根据错误码提供更具体的建议
+        switch e.Extra {
+            case 0x80072EE7: ; 无法解析服务器名称或地址
+                logger.err("DNS解析失败，请检查网络连接和URL地址")
+            case 0x80072EFD: ; 无法建立连接
+                logger.err("无法连接到服务器，可能是防火墙或网络问题")
+            case 0x80072EE2: ; 操作超时
+                logger.err("请求超时，请检查网络连接或尝试增加超时时间")
+        }
+
+        return ""
+    }
+}
+
+; 带重试机制的版本
+GetUrlResponseWithRetry(url, maxRetries := 3, timeout := 10000) {
+    loop maxRetries {
+        response := GetUrlResponse(url, timeout)
+        if (response != "") {
+            return response
+        }
+
+        if (A_Index < maxRetries) {
+            logger.info("第 " A_Index " 次请求失败，"
+                . Round((A_Index) * 1000) "ms后重试...")
+            Sleep((A_Index) * 1000) ; 递增延迟
+        }
+    }
+
+    logger.err("所有重试均失败，无法获取响应")
+    return ""
+}
+
 UpdateFromInternet(GuiCtrlObj, Info) {
+    apiUrl := "https://api.github.com/repos/Angels-D/TroveAuto/releases/latest"
+
+    response := GetUrlResponseWithRetry(apiUrl, 3, 15000) ; 3次重试，15秒超时
+    if (response != "") {
+        logger.info("响应内容: " response)
+    }
+
     Source := config.data["Global"]["Source"] "releases/latest/download/config.ini"
     Mirror := config.data["Global"]["Mirror"] Source
     if (config.Update(Mirror) Or config.Update(Source)) {
@@ -1487,7 +1559,7 @@ class Game {
             "TargetBoss", false,
             "TargetList", false,
             "ScanAll", false,
-            "BossLevel", 4,
+            "BossLevel", 6,
         ),
         "SpeedUp", Map(
             "On", false,
