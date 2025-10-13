@@ -1,0 +1,12 @@
+[2025-10-13 10:57:58] [thread  17188 ] [  info  ] | Module::shortStallOn _value text: 0 
+[2025-10-13 10:57:58] [thread  17188 ] [  info  ] | Module::shortStallRules _value text: gameplay/chest_quest_rune_vault_01:6:15 
+[2025-10-13 11:58:22] [thread  14464 ] [  info  ] | Module::shortStallOn _value text: 0 
+[2025-10-13 11:58:22] [thread  14464 ] [  info  ] | Module::shortStallRules _value text: gameplay/chest_quest_rune_vault_01:6:15 
+[2025-10-13 12:03:34] [thread  18788 ] [  info  ] | Module::shortStallOn _value text: 0 
+[2025-10-13 12:03:34] [thread  18788 ] [  info  ] | Module::shortStallRules _value text: gameplay/chest_quest_rune_vault_01:6:15 
+[2025-10-13 12:09:06] [thread  18864 ] [  info  ] | Module::shortStallOn _value text: 0 
+[2025-10-13 12:09:06] [thread  18864 ] [  info  ] | Module::shortStallRules _value text: gameplay/chest_quest_rune_vault_01:6:15 
+[2025-10-13 12:12:04] [thread  17956 ] [  info  ] | Module::shortStallOn _value text: 0 
+[2025-10-13 12:12:04] [thread  17956 ] [  info  ] | Module::shortStallRules _value text: gameplay/chest_quest_rune_vault_01:6:15 
+[2025-10-13 12:13:09] [thread  17268 ] [  info  ] | Module::shortStallOn _value text: 0 
+[2025-10-13 12:13:09] [thread  17268 ] [  info  ] | Module::shortStallRules _value text: gameplay/chest_quest_rune_vault_01:6:15 

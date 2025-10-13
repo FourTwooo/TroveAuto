@@ -11,6 +11,11 @@
 #DllLoad Module
 #Include <log>   ; 引入 log4ahk（v2 版）
 
+GetTimeoutIdsFromDll() {
+    ptr := DllCall("Module\GetTimeoutIdsA", "ptr")
+    return StrGet(ptr, "UTF-8")
+}
+
 ; 控制台（可选，便于直接看到）
 if !DllCall("kernel32\GetConsoleWindow", "ptr")
     DllCall("kernel32\AllocConsole")
@@ -227,6 +232,30 @@ config := _Config(
             "Use_T", "-384,FE FF FF FF 00 00 00 00 65 CF XX XX 0E 00 00 00 55 CF",
             "Use_Q", "-384,FE FF FF FF 00 00 00 00 65 CF XX XX 0A 00 00 00 55 CF",
         ),
+        "Follow", Map(                             ; ← 新增：跟随相关参数（持久化）
+            "BossLevel", "4",                      ; Module::bossLevel
+            "TpStep", "4",                         ; Module::tpStep
+            "MapWidth", "4300",                    ; Module::mapWidth
+            "EntityScand", "100",                  ; Module::entityScand
+            "MaxY", "200",                         ; Module::maxY
+            "MinY", "-45",                         ; Module::minY
+            "AimOffsetX", "1.25",                  ; Module::aimOffset.x（玩家Y偏移）
+            "AimOffsetY", "0.25",                   ; Module::aimOffset.y（目标Y偏移）
+            "PriorityOn", "1",                      ; 自动宝箱开关
+            "priorityChestWaitMs", "500",                ; 观察窗口(ms)；0 表示关闭
+            "PriorityList",
+            "gameplay/chest_quest_rune_vault_01,gameplay/chest_quest_standard_large,gameplay/chest_quest_standard_small,gameplay/chest_quest_geode_5star_large,gameplay/chest_quest_geode_5star_small,.*chest_quest_recipe.*",
+            "TimeOutIdsOn", "1",                    ; “临时黑名单” 开关
+            "TimeOutIdsList", "",
+            "ButtonStartsOn", "1",
+            "ButtonStartsList",
+            "quest_assault_trigger,quest_spawn_trigger_fivestar_depths,quest_spawn_trigger_fivestar",
+            "chestLootWaitMs", "0",          ; 开箱后“原地等待捡装”的时间(ms)，0=关闭（不自动拾取）
+            "timeoutBlacklistMs", "60000",   ; 普通目标：超时拉黑阈值(ms)
+            "timeoutBlacklistMs5star", "240000", ; 5星相关：超时拉黑阈值(ms)
+            "ShortStallOn", "0",                              ; 短暂停滞开关（已有，留着）
+            "ShortStallRules", "gameplay/chest_quest_rune_vault_01:6:15",  ; 默认规则（id:检测距离:停滞秒）
+        ),
     )
 )
 
@@ -335,14 +364,24 @@ for name in featuresOrder {
         MainGui.Add("CheckBox", pos " w140 v" name, label)
     }
 }
-MainGui.Add("GroupBox", "xs-10 ys+40 w310 r4.2 Section", t("跟随目标") "       " t("正则表达式 逗号隔开"))
+MainGui.Add("GroupBox", "xs-10 ys+40 w310 r4.2 Section", t("跟随目标") "       " t("正则表达式[逗号隔开]"))
 MainGui.Add("CheckBox", "xp+80 yp vFollowTarget")
+
+; —— 在同一水平线上，靠右加一个“设置”按钮（在线中间，不歪）
+;    已知：复选框用了 xp+80，所以 groupbox 左边界 = 复选框x - 80；groupbox宽度固定 w310
+MainGui["FollowTarget"].GetPos(&fx, &fy, &fw, &fh)
+gbx := fx - 80
+gbr := gbx + 310
+btnW := 56
+btnH := 22
+btnX := gbr - btnW - 10      ; 右侧内边距 10px
+btnY := fy - 2               ; 让按钮“在线中间”，与你 AddCheckAndButton 的对齐风格一致
+MainGui.Add("Button", Format("x{} y{} w{} h{} +0x100 vFollowTargetCfgBtn", btnX, btnY, btnW, btnH), t("设置"))
+
 MainGui.Add("Text", "xs+10 ys+30 Section", t("玩家列表:"))
 MainGui.Add("Edit", "ys w205 vFollowTarget_PlayerName")
 MainGui.Add("Text", "xs ys+30 Section", t("实体列表:"))
 MainGui.Add("Edit", "ys w205 vFollowTarget_TargetName")
-MainGui.Add("Text", "xs ys+30 Section", t("怪物等级:")) ; 调整为和上面两行一致
-MainGui.Add("Edit", "ys w205 Number vFollowTarget_BossLevel", 4) ; 调整宽度为 205
 
 MainGui.Add("CheckBox", "xs w90 Section vFollowTarget_TargetBoss", t("跟踪Boss"))
 MainGui.Add("CheckBox", "ys w90 vFollowTarget_TargetList", t("全局名单"))
@@ -470,6 +509,7 @@ MainGui.Add("Button", "y+30 w200 h60 vDownloadBtn", t("最新版脚本下载"))
 
 ; 绑定交互
 MainGui.OnEvent("Close", Close, -1)
+MainGui["FollowTargetCfgBtn"].OnEvent("Click", FollowSettingsEdit)
 MainGui["GamePathBtn"].OnEvent("Click", GetGamePath)
 MainGui["GameStartBtn"].OnEvent("Click", GameStart)
 MainGui["UseLogPathBtn"].OnEvent("Click", OpenUseLogPath)
@@ -494,7 +534,7 @@ MainGui["FollowTarget"].OnEvent("Click", FollowTarget)
 MainGui["AutoAim"].OnEvent("Click", AutoAim)
 MainGui["SpeedUp"].OnEvent("Click", SpeedUp)
 for name in ["FollowTarget_PlayerName", "FollowTarget_TargetName", "FollowTarget_TargetBoss", "FollowTarget_TargetList",
-    "FollowTarget_ScanAll", "FollowTarget_BossLevel", "SpeedUp_SpeedUpRate", "AutoAim_AimRange", "AutoAim_TargetBoss",
+    "FollowTarget_ScanAll", "SpeedUp_SpeedUpRate", "AutoAim_AimRange", "AutoAim_TargetBoss",
     "AutoAim_TargetNormal", "AutoAim_TargetPlant"] {
     try MainGui[name].OnEvent("Change", SomeUiSetChangeEvent)
     catch
@@ -515,6 +555,518 @@ A_TrayMenu.Add(t("显示 主程序"), (ItemName, ItemPos, MyMenu) => (MainGui.Sh
 A_TrayMenu.Add(t("重新启动"), (ItemName, ItemPos, MyMenu) => (Game.Reset(), Reload()))
 A_TrayMenu.Add(t("退出"), (ItemName, ItemPos, MyMenu) => (Game.Reset(), ExitApp()))
 A_TrayMenu.Add(t("关闭终端日志"), (ItemName, ItemPos, MyMenu) => (ToggleConsoleLog(ItemName, ItemPos, MyMenu)))
+
+; 解析 "id:dist:secs;id2:dist:secs" → [{id, dist, secs}, ...]
+ShortStall_Parse(str) {
+    arr := []
+    if !IsSet(str) || (Trim(str) = "")
+        return arr
+    for part in StrSplit(Trim(str), ";") {
+        p := Trim(part)
+        if (p = "")
+            continue
+        seg := StrSplit(p, ":")
+        id := seg.Length >= 1 ? Trim(seg[1]) : ""
+        dist := seg.Length >= 2 ? Trim(seg[2]) : "6"
+        secs := seg.Length >= 3 ? Trim(seg[3]) : "15"
+        if (id != "")
+            arr.Push(Map("id", id, "dist", dist, "secs", secs))
+    }
+    return arr
+}
+
+; 右键菜单（添加 / 删除）
+ShortStallMenu(GuiCtrlObj, Item, IsRightClick, X, Y) {
+    m := Menu()
+    m.Add(t("添加"), (ItemName, ItemPos, MyMenu) => ShortStallEdit(GuiCtrlObj, 0, true))
+    if (Item)
+        m.Add(t("删除"), (ItemName, ItemPos, MyMenu) => (
+            GuiCtrlObj.Delete(Item)
+        ))
+    m.Show()
+}
+
+; 添加/编辑 窗口
+ShortStallEdit(GuiCtrlObj, Item, isAdd := false) {
+    Owner := GuiCtrlObj.Gui
+    Owner.Opt("+Disabled")
+    w := Gui("-DPIScale OwnDialogs Owner" Owner.Hwnd)
+    w.MarginX := 14, w.MarginY := 12
+    w.SetFont("s10")
+
+    curId := Item ? GuiCtrlObj.GetText(Item, 1) : ""
+    curDist := Item ? GuiCtrlObj.GetText(Item, 2) : "6.0"
+    curSecs := Item ? GuiCtrlObj.GetText(Item, 3) : "15"
+
+    w.Add("Text", "w120 Right", t("ID:"))
+    w.Add("Edit", "ys w280 vSS_Id", curId)
+
+    w.Add("Text", "xs w120 Section Right", t("检测距离:"))
+    w.Add("Edit", "ys w120 vSS_Dist", curDist)
+
+    w.Add("Text", "xs w120 Section Right", t("停滞时间(秒):"))
+    w.Add("Edit", "ys w120 Number vSS_Secs", curSecs)
+    w.Add("UpDown", "Range0-216000 +0x10 +0x80", Integer(curSecs))
+
+    w.Add("Button", "xs y+10 w120 vSS_Save", t("保存"))
+    w.Add("Button", "x+10 w120 vSS_Cancel", t("取消"))
+
+    w["SS_Save"].OnEvent("Click", (*) => (
+        w.Submit("NoHide")
+        , id := Trim(w["SS_Id"].Value)
+        , dist := Trim(w["SS_Dist"].Value)
+        , secs := Trim(w["SS_Secs"].Value)
+        , (id = "" ? (MsgBox(t("ID不能为空")), 0) : (
+            !IsNumber(dist) ? (MsgBox(t("检测距离需为数字")), 0) : (
+                !IsInteger(Integer(secs)) ? (MsgBox(t("停滞时间需为整数秒")), 0) : (
+                    (isAdd || !Item)
+                        ? (GuiCtrlObj.Add("", id, dist, secs), 1)
+                        : (GuiCtrlObj.Modify(Item, , id, dist, secs), 1)
+                )
+            )
+        ))
+        , WinClose()
+    ))
+    w["SS_Cancel"].OnEvent("Click", (*) => WinClose())
+    w.OnEvent("Close", (*) => (Owner.Opt("-Disabled")))
+    w.Show("AutoSize Center")
+}
+
+FollowSettingsEdit(*) {
+    ; === 读取配置 ===
+    b := Integer(config.data["Follow"]["BossLevel"] ?? 4)
+    ts := Integer(config.data["Follow"]["TpStep"] ?? 4)
+    mw := Integer(config.data["Follow"]["MapWidth"] ?? 4300)
+    es := Integer(config.data["Follow"]["EntityScand"] ?? 100)
+    maxy := config.data["Follow"]["MaxY"] ?? "200"
+    miny := config.data["Follow"]["MinY"] ?? "-45"
+    aox := config.data["Follow"]["AimOffsetX"] ?? "1.25"
+    aoy := config.data["Follow"]["AimOffsetY"] ?? "0.25"
+
+    pOn := Integer(config.data["Follow"]["PriorityOn"] ?? 1)
+    pWait := Integer(config.data["Follow"]["priorityChestWaitMs"] ?? 500)
+    pList := config.data["Follow"]["PriorityList"] ??
+        "gameplay/chest_quest_rune_vault_01,gameplay/chest_quest_standard_large,gameplay/chest_quest_standard_small,gameplay/chest_quest_geode_5star_large,gameplay/chest_quest_geode_5star_small,.*chest_quest_recipe.*"
+    tsOn := Integer(config.data["Follow"]["TimeOutIdsOn"] ?? 1)
+    tsList := GetTimeoutIdsFromDll() ?? ""
+
+    shortOn := Integer(config.data["Follow"]["ShortStallOn"] ?? 0)
+
+    ; === 新增：自动拾取 & 超时参数 ===
+    clWait := Integer(config.data["Follow"]["chestLootWaitMs"] ?? 0)
+    pickOn := clWait > 0 ? 1 : 0
+    toNormal := Integer(config.data["Follow"]["timeoutBlacklistMs"] ?? 60000)
+    to5star := Integer(config.data["Follow"]["timeoutBlacklistMs5star"] ?? 240000)
+
+    ; === 顶层窗口 ===
+    dlg := Gui("-DPIScale +OwnDialogs +Resize HScroll VScroll", t("跟随设置"))
+    dlg.MarginX := 16, dlg.MarginY := 12
+    dlg.SetFont("s10")
+    leftMargin := dlg.MarginX
+
+    ; 顶部说明 + 固定按钮条（你上一次的需求）
+    dlg.Add("Text", "xm w640 cGray", t("点击保存后生效"))
+    dlg.Add("Button", "xm y+6 w120 vFS_Save", t("保存"))
+    dlg.Add("Button", "x+10 w120 vFS_Default", t("恢复默认"))
+    dlg.Add("Button", "x+10 w120 vFS_Cancel", t("取消"))
+
+    ; ======= Tab =======
+    tabs := dlg.Add("Tab3", "xm y+10 vFS_Tab", [t("基础"), t("名单"), t("高级")])
+    pageBottom := Map(1, 0, 2, 0, 3, 0)
+    track := (ctrl, idx) => (ctrl.GetPos(, &y, , &h), pageBottom[idx] := Max(pageBottom[idx], y + h))
+
+    ; --- 基础（保持不变） ---
+    tabs.UseTab(t("基础"))
+
+    gbBase := dlg.Add("GroupBox", "xm y+10 w640 h178", t("基础参数"))
+    gbBase.GetPos(&bx, &by, &bw, &bh)
+
+    ; 左列
+    row := by + 28
+    colL := bx + 12, labW := 140, edW := 120, gap := 10
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("Boss等级判定 ≥:"))
+    edBoss := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_BossLevel", colL + labW + gap, row - 3, edW), b)
+    dlg.Add("UpDown", "Range1-99 +0x10 +0x80", b)
+    track(edBoss, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("传送步进距离:"))
+    edStep := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_TpStep", colL + labW + gap, row - 3, edW), ts)
+    dlg.Add("UpDown", "Range1-50 +0x10 +0x80", ts)
+    track(edStep, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("地图扫描半径:"))
+    edMW := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_MapWidth", colL + labW + gap, row - 3, edW), mw)
+    dlg.Add("UpDown", "Range500-10000 +0x10 +0x80", mw)
+    track(edMW, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("六角格间距:"))
+    edES := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_EntityScand", colL + labW + gap, row - 3, edW), es)
+    dlg.Add("UpDown", "Range20-500 +0x10 +0x80", es)
+    track(edES, 1)
+
+    ; 右列
+    colR := colL + 330, row := by + 28
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colR, row, labW), t("最高高度MaxY:"))
+    edMaxY := dlg.Add("Edit", Format("x{} y{} w{} vFS_MaxY", colR + labW + gap, row - 3, edW), maxy)
+    track(edMaxY, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colR, row, labW), t("最低高度MinY:"))
+    edMinY := dlg.Add("Edit", Format("x{} y{} w{} vFS_MinY", colR + labW + gap, row - 3, edW), miny)
+    track(edMinY, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colR, row, labW), t("自瞄偏移玩家Y:"))
+    edAOX := dlg.Add("Edit", Format("x{} y{} w{} vFS_AimOffX", colR + labW + gap, row - 3, edW), aox)
+    track(edAOX, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colR, row, labW), t("自瞄偏移目标Y:"))
+    edAOY := dlg.Add("Edit", Format("x{} y{} w{} vFS_AimOffY", colR + labW + gap, row - 3, edW), aoy)
+    track(edAOY, 1)
+
+    ; 读取已有规则字符串（形如 "id:dist:secs;id2:dist:secs"）
+    rulesStr := config.data["Follow"]["ShortStallRules"] ?? "gameplay/chest_quest_rune_vault_01:6:15"
+
+    ; --- 名单（最终对齐版：中线复选框 + 统一缩进/行距） ---
+    tabs.UseTab(t("名单"))
+
+    ; 全局排版参数（想更右/更松，改这里）
+    INDENT := 40   ; 组内统一左缩进（px）
+    ROW_H := 32   ; 行高
+    ROW_START := 36   ; 第一行距离组框上边的距离（避免顶线贴控件）
+
+    labW := 160, edW := 130, gap := 10
+
+    ; ========== 自动宝箱 ==========
+    gbP := dlg.Add("GroupBox", "xm y+10 w640 h150 Section", " ")       ; 空标题，完整绘制横线
+    cbP := dlg.Add("CheckBox", "ys xp+12 vFS_PChest_On", t("自动宝箱")) ; ★ 和主界面同法：ys=同一基线，xp+12=微移
+    cbP.Value := pOn
+    gbP.GetPos(&gx, &gy, &gw, &gh)
+
+    row := gy + ROW_START, colL := gx + INDENT
+
+    ; 行1：观察窗口
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("检测时间(ms):"))
+    edWait := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_PChest_Wait", colL + labW + gap, row - 3, edW), pWait)
+    dlg.Add("UpDown", "Range0-600000 +0x10 +0x80", pWait)
+    row += ROW_H
+
+    ; 行2：自动拾取
+    pickCb := dlg.Add("CheckBox", Format("x{} y{} vFS_Pick_On AutoSize", colL, row), t("强制等待(ms):"))
+    pickCb.Value := pickOn
+
+    ; 把输入框贴在复选框文字后面
+    pickCb.GetPos(&cbx, &cby, &cbw, &cbh)
+    edPick := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_Pick_Wait", cbx + cbw + 8, cby - 3, edW), clWait)
+    dlg.Add("UpDown", "Range0-600000 +0x10 +0x80", clWait)
+
+    ; 联动
+    dlg["FS_Pick_Wait"].Enabled := pickOn ? true : false
+    pickCb.OnEvent("Click", (*) => (dlg["FS_Pick_Wait"].Enabled := pickCb.Value))
+
+    ; 行距推进（按真实高度）
+    row := Max(row, cby + cbh) + 8
+
+    ; 行3：优先列表(正则)
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("优先列表(正则):"))
+    editW := gw - (colL + labW + gap) - 12
+    edPL := dlg.Add("Edit"
+        , Format("x{} y{} w{} r1 -VScroll -Multi +0x80 vFS_PChest_List"
+            , colL + labW + gap, row - 3, editW)
+        , pList)
+    track(edPL, 2)
+
+    ; 联动
+    dlg["FS_Pick_Wait"].Enabled := pickOn ? true : false
+    pickCb.OnEvent("Click", (*) => (dlg["FS_Pick_Wait"].Enabled := pickCb.Value))
+
+    ; ; ========== 临时黑名单 ==========
+    gbB := dlg.Add("GroupBox", "xm y+18 w640 h155 Section", " ")
+    cbB := dlg.Add("CheckBox", "ys xp+12 vFS_Btn_On", t("临时黑名单"))
+    cbB.Value := tsOn
+    gbB.GetPos(&bx, &by, &bw, &bh)
+
+    row := by + ROW_START, colL := bx + INDENT
+
+    ; 行1：黑名单(正则)
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("黑名单(正则):"))
+    editW := bw - (colL + labW + gap) - 12
+    edBL := dlg.Add("Edit"
+        , Format("x{} y{} w{} r1 -VScroll -Multi +0x80 vFS_Btn_List"
+            , colL + labW + gap, row - 3, editW)
+        , tsList)
+    row += ROW_H + 34            ; 文本域更高，适当多加些
+
+    ; 行2：普通/5★ 超时(ms)
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("普通/5★超时(ms):"))
+    edToN := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_Timeout_Normal", colL + labW + gap, row - 3, edW), toNormal
+    )
+    dlg.Add("UpDown", "Range0-21600000 +0x10 +0x80", toNormal)
+    dlg.Add("Text", Format("x{} y{} w20 Center", colL + labW + gap + edW + 6, row), "/")
+    edTo5 := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_Timeout_5star", colL + labW + gap + edW + 24, row - 3, edW),
+    to5star)
+    dlg.Add("UpDown", "Range0-21600000 +0x10 +0x80", to5star)
+    track(edTo5, 2)
+
+    ; ========== 短暂停滞 ==========
+    gbS := dlg.Add("GroupBox", "xm y+18 w640 h250 Section", " ")
+    cbS := dlg.Add("CheckBox", "ys xp+12 vFS_Short_On", t("短暂停滞"))
+    cbS.Value := shortOn
+    gbS.GetPos(&sx, &sy, &sw, &sh)
+
+    ; ; 列表（统一左缩进；ID列更宽）
+    lvX := sx + INDENT - 10, lvY := sy + ROW_START, lvW := sw - (INDENT - 10) - 12
+    lvS := dlg.Add("ListView"
+        , Format("x{} y{} w{} r7 Grid NoSortHdr vShortStallBox", lvX, lvY, lvW)
+        , [t("ID"), t("检测距离"), t("停滞时间(秒)")])
+
+    ID_COL_W := lvW - (90 + 120) - 14
+    if (ID_COL_W < 280)
+        ID_COL_W := 280
+    lvS.ModifyCol(1, ID_COL_W)
+    lvS.ModifyCol(2, 60)
+    lvS.ModifyCol(3, 120)
+
+    for rule in ShortStall_Parse(rulesStr)
+        lvS.Add("", rule["id"], rule["dist"], rule["secs"])
+
+    lvS.OnEvent("ContextMenu", ShortStallMenu)
+    lvS.OnEvent("DoubleClick", ShortStallEdit)
+    lvS.Enabled := (cbS.Value ? true : false)
+    cbS.OnEvent("Click", (*) => (dlg["ShortStallBox"].Enabled := cbS.Value))
+    track(lvS, 2)
+
+    ; --- 高级（占位） ---
+    tabs.UseTab(t("高级"))
+    advT := dlg.Add("Text", "xm y+20 w640 cGray", t("预留功能位（后续追加）。"))
+    track(advT, 3)
+    tabs.UseTab()
+
+    ; 事件绑定
+    dlg["FS_Save"].OnEvent("Click", FollowSettingsSave.Bind(dlg))
+    dlg["FS_Default"].OnEvent("Click", FollowSettingsDefaults.Bind(dlg))
+    dlg["FS_Cancel"].OnEvent("Click", (*) => dlg.Destroy())
+    dlg.OnEvent("Close", (*) => dlg.Destroy())
+
+    dlg.Show("Center")
+}
+
+FollowSettingsDefaults(dlg, *) {
+    try {
+        ; 基础
+        dlg["FS_BossLevel"].Value := 4
+        dlg["FS_TpStep"].Value := 4
+        dlg["FS_MapWidth"].Value := 4300
+        dlg["FS_EntityScand"].Value := 100
+        dlg["FS_MaxY"].Value := "200"
+        dlg["FS_MinY"].Value := "-45"
+        dlg["FS_AimOffX"].Value := "1.25"
+        dlg["FS_AimOffY"].Value := "0.25"
+
+        ; 名单（自动宝箱/临时黑名单）
+        dlg["FS_PChest_On"].Value := 1
+        dlg["FS_PChest_Wait"].Value := 500
+        dlg["FS_PChest_List"].Value :=
+            "gameplay/chest_quest_rune_vault_01,gameplay/chest_quest_standard_large,gameplay/chest_quest_standard_small,gameplay/chest_quest_geode_5star_large,gameplay/chest_quest_geode_5star_small,.*chest_quest_recipe.*"
+        dlg["FS_Btn_On"].Value := 1
+        dlg["FS_Btn_List"].Value := ""
+
+        ; 自动拾取（默认关闭）
+        dlg["FS_Pick_On"].Value := 0
+        dlg["FS_Pick_Wait"].Value := 0
+
+        ; 超时时间默认值
+        dlg["FS_Timeout_Normal"].Value := 60000
+        dlg["FS_Timeout_5star"].Value := 240000
+
+        ; 短暂停滞：默认关闭 + 默认规则一条
+        dlg["FS_Short_On"].Value := 0
+        try {
+            dlg["ShortStallBox"].Delete()
+            dlg["ShortStallBox"].Add("", "gameplay/chest_quest_rune_vault_01", "6.0", "15")
+        }
+
+    }
+}
+
+FollowSettingsSave(dlg, *) {
+    dlg.Submit("NoHide")
+
+    ; ===== 基础 =====
+    b := Integer(dlg["FS_BossLevel"].Value)
+    ts := Integer(dlg["FS_TpStep"].Value)
+    mw := Integer(dlg["FS_MapWidth"].Value)
+    es := Integer(dlg["FS_EntityScand"].Value)
+    maxy := dlg["FS_MaxY"].Value
+    miny := dlg["FS_MinY"].Value
+    aox := dlg["FS_AimOffX"].Value
+    aoy := dlg["FS_AimOffY"].Value
+
+    b := b < 1 ? 1 : (b > 99 ? 99 : b)
+    ts := ts < 1 ? 1 : (ts > 50 ? 50 : ts)
+    mw := mw < 500 ? 500 : (mw > 10000 ? 10000 : mw)
+    es := es < 20 ? 20 : (es > 500 ? 500 : es)
+    if !IsNumber(maxy) {
+        maxy := "200"
+    }
+    if !IsNumber(miny) {
+        miny := "-45"
+    }
+    if !IsNumber(aox) {
+        aox := "1.25"
+    }
+    if !IsNumber(aoy) {
+        aoy := "0.25"
+    }
+    ; ===== 名单 =====
+    pOn := dlg["FS_PChest_On"].Value
+    pWait := Integer(dlg["FS_PChest_Wait"].Value)
+    pWait := pWait < 0 ? 0 : (pWait > 600000 ? 600000 : pWait)
+    pList := Trim(dlg["FS_PChest_List"].Value)
+
+    tsOn := dlg["FS_Btn_On"].Value
+    tsList := Trim(dlg["FS_Btn_List"].Value)
+
+    ; 短暂停滞
+    shortOn := dlg["FS_Short_On"].Value
+
+    ; ===== 写 config（持久化） =====
+    config.data["Follow"]["BossLevel"] := String(b)
+    config.data["Follow"]["TpStep"] := String(ts)
+    config.data["Follow"]["MapWidth"] := String(mw)
+    config.data["Follow"]["EntityScand"] := String(es)
+    config.data["Follow"]["MaxY"] := String(maxy)
+    config.data["Follow"]["MinY"] := String(miny)
+    config.data["Follow"]["AimOffsetX"] := String(aox)
+    config.data["Follow"]["AimOffsetY"] := String(aoy)
+
+    config.data["Follow"]["PriorityOn"] := pOn ? "1" : "0"
+    config.data["Follow"]["priorityChestWaitMs"] := String(pWait)
+    config.data["Follow"]["PriorityList"] := pList
+
+    config.data["Follow"]["TimeOutIdsOn"] := tsOn ? "1" : "0"
+    config.data["Follow"]["TimeOutIdsList"] := tsList
+
+    config.data["Follow"]["ShortStallOn"] := shortOn ? "1" : "0"
+
+    ; ===== 自动拾取（开箱后原地等待捡装） =====
+    pickOn := dlg["FS_Pick_On"].Value
+    clWait := Integer(dlg["FS_Pick_Wait"].Value)
+    clWait := clWait < 0 ? 0 : (clWait > 600000 ? 600000 : clWait)
+
+    config.data["Follow"]["chestLootWaitMs"] := pickOn ? String(clWait) : "0"
+
+    ; ===== 超时阈值 =====
+    toN := Integer(dlg["FS_Timeout_Normal"].Value)
+    toN := toN < 0 ? 0 : (toN > 21600000 ? 21600000 : toN)
+    to5 := Integer(dlg["FS_Timeout_5star"].Value)
+    to5 := to5 < 0 ? 0 : (to5 > 21600000 ? 21600000 : to5)
+
+    config.data["Follow"]["timeoutBlacklistMs"] := String(toN)
+    config.data["Follow"]["timeoutBlacklistMs5star"] := String(to5)
+
+    ; ===== 短暂停滞规则 =====
+    rules := ""
+    lv := dlg["ShortStallBox"]
+    rowCount := lv.GetCount()
+    loop rowCount {
+        id := Trim(lv.GetText(A_Index, 1))
+        dist := Trim(lv.GetText(A_Index, 2))
+        secs := Trim(lv.GetText(A_Index, 3))
+        if (id != "") {
+            if (rules != "")
+                rules .= ";"
+            rules .= id ":" dist ":" secs
+        }
+    }
+    config.data["Follow"]["ShortStallRules"] := rules
+
+    config.Save()
+
+    UpdateConfig("Module::shortStallRules", StrLen(rules) ? rules : " ")
+
+    UpdateConfig("Module::chestLootWaitMs", pickOn ? String(clWait) : "0")
+    UpdateConfig("Module::timeoutBlacklistMs", String(toN))
+    UpdateConfig("Module::timeoutBlacklistMs5star", String(to5))
+
+    ; ===== 立即下发到 DLL =====
+    UpdateConfig("Module::bossLevel", String(b))
+    UpdateConfig("Module::tpStep", String(ts))
+    UpdateConfig("Module::mapWidth", String(mw))
+    UpdateConfig("Module::entityScand", String(es))
+    UpdateConfig("Module::maxY", String(maxy))
+    UpdateConfig("Module::minY", String(miny))
+    UpdateConfig("Module::aimOffset", String(aox) "|" String(aoy))
+
+    UpdateConfig("Module::priorityChestWaitMs", pOn ? String(pWait) : "0")
+    UpdateConfig("Module::priorityChests", pList)
+
+    UpdateConfig("Module::timeOutIds", tsList ? tsList : " ")
+    UpdateConfig("Module::timeOutIdsEnabled", tsOn ? "true" : "false")
+
+    UpdateConfig("Module::shortStallOn", shortOn ? "1" : "0")
+
+    try logger.info(Format(
+        "跟随设置已保存：boss={1}, tpStep={2}, mapWidth={3}, entityScand={4}, maxY={5}, minY={6}, aimOffset=({7},{8}), "
+        . "PriOn={9}, PriWait={10}, PriList(len)={11}, timeOutIdsOn={12}, timeOutIdsList(len)={13}, shortStallOn={14}"
+        , b, ts, mw, es, maxy, miny, aox, aoy
+        , pOn, pWait, StrLen(pList), tsOn, StrLen(tsList), shortOn))
+
+    dlg.Destroy()
+}
+
+SyncFollowToDll() {
+    flw := config.data["Follow"]
+
+    ; ---- 基础参数 ----
+    boss := String(Integer(flw["BossLevel"] ?? 4))
+    tp := String(Integer(flw["TpStep"] ?? 4))
+    mw := String(Integer(flw["MapWidth"] ?? 4300))
+    es := String(Integer(flw["EntityScand"] ?? 100))
+    maxy := String(flw["MaxY"] ?? "200")
+    miny := String(flw["MinY"] ?? "-45")
+    aox := String(flw["AimOffsetX"] ?? "1.25")
+    aoy := String(flw["AimOffsetY"] ?? "0.25")
+
+    UpdateConfig("Module::bossLevel", boss)
+    UpdateConfig("Module::tpStep", tp)
+    UpdateConfig("Module::mapWidth", mw)
+    UpdateConfig("Module::entityScand", es)
+    UpdateConfig("Module::maxY", maxy)
+    UpdateConfig("Module::minY", miny)
+    UpdateConfig("Module::aimOffset", aox "|" aoy)
+
+    ; ---- 自动宝箱 ----
+    priOn := flw.Has("PriorityOn") ? flw["PriorityOn"] : "1"
+    pWait := String(Integer(flw["priorityChestWaitMs"] ?? 500))
+    pList := flw.Has("PriorityList") ? flw["PriorityList"] : ""
+    UpdateConfig("Module::priorityChestWaitMs", (priOn = "1") ? pWait : "0")
+    UpdateConfig("Module::priorityChests", StrLen(pList) ? pList : " ")
+
+    ; ---- 临时黑名单 ----
+    toOn := flw.Has("TimeOutIdsOn") ? flw["TimeOutIdsOn"] : "1"
+    ; toList := flw.Has("TimeOutIdsList") ? flw["TimeOutIdsList"] : ""
+    ; UpdateConfig("Module::timeOutIds", StrLen(toList) ? toList : " ")
+    UpdateConfig("Module::timeOutIdsEnabled", (toOn = "1") ? "true" : "false")
+
+    ; ---- 短暂停滞 ----
+    sso := String(Integer(flw["ShortStallOn"] ?? 0))
+    UpdateConfig("Module::shortStallOn", sso)
+
+    ; ---- 自动拾取 & 超时阈值 ----
+    clw := String(Integer(flw["chestLootWaitMs"] ?? 0))
+    UpdateConfig("Module::chestLootWaitMs", clw)
+
+    toN := String(Integer(flw["timeoutBlacklistMs"] ?? 60000))
+    to5 := String(Integer(flw["timeoutBlacklistMs5star"] ?? 240000))
+    UpdateConfig("Module::timeoutBlacklistMs", toN)
+    UpdateConfig("Module::timeoutBlacklistMs5star", to5)
+
+    ; ---- 短暂停滞 规则 ----
+    rules := flw.Has("ShortStallRules") ? flw["ShortStallRules"] : ""
+    UpdateConfig("Module::shortStallRules", StrLen(rules) ? rules : " ")
+
+}
 
 ; 交互函数
 Close(thisGui) {
@@ -689,8 +1241,8 @@ UIReset() {
         "Map", "Mining", "MiningGeode", "NoClip", "UseLog", "Zoom", "AutoBtn_Key_Click_LEFT", "AutoBtn_Key_Click_RIGHT",
         "AutoBtn_NoTop", "HotKeyBox", "Interval", "SelectAction", "StartBtn", "FollowTarget", "FollowTarget_PlayerName",
         "FollowTarget_TargetName", "FollowTarget_TargetBoss", "FollowTarget_TargetList", "FollowTarget_ScanAll",
-        "FollowTarget_BossLevel", "SpeedUp", "SpeedUp_SpeedUpRate", "AutoAim", "AutoAim_AimRange", "AutoAim_TargetBoss",
-        "AutoAim_TargetNormal", "AutoAim_TargetPlant", "AutoPotion", "AutoPotionCfg"]
+        "SpeedUp", "SpeedUp_SpeedUpRate", "AutoAim", "AutoAim_AimRange", "AutoAim_TargetBoss",
+        "AutoAim_TargetNormal", "AutoAim_TargetPlant", "AutoPotion", "AutoPotionCfg", "FollowTargetCfgBtn"]
         MainGui[key].Enabled := false
     for key in ["Animation", "Attack", "BlindMode", "Breakblocks", "ByPass", "ClipCam", "Dismount", "Health", "LockCam",
         "Map", "Mining", "MiningGeode", "NoClip", "UseLog", "Zoom", "AutoBtn_Key_Click_LEFT", "AutoBtn_Key_Click_RIGHT",
@@ -740,41 +1292,53 @@ Start(GuiCtrlObj, Info) {
         }
     }
 }
+
 Save(GuiCtrlObj := unset, Info := unset) {
     for sect, data in config.data {
+        ; 跳过不需要从主“设置”页收集的部分
         if (InStr(sect, "Language_", true) == 1
         or sect == "Address_Offset"
         or sect == "Features_Change"
         or sect == "Address_Offset_Signature"
         or sect == "AutoPotion")
             continue
+
         for key in data {
+            value := ""
+            ; 优先读控件（如果存在）
             try {
-                if MainGui[key sect].Type == "ComboBox"
-                    value := MainGui[key sect].Text
-                else
-                    value := MainGui[key sect].Value
-            }
-            catch {
+                ctrl := MainGui[key sect]               ; 例如: "AnimationAddress"
+                value := (ctrl.Type = "ComboBox") ? ctrl.Text : ctrl.Value
+            } catch {
                 try {
-                    if MainGui[key == "Value" ? sect : key].Type == "ComboBox"
-                        value := MainGui[key == "Value" ? sect : key].Text
-                    else
-                        value := MainGui[key == "Value" ? sect : key].Value
-                }
-                catch
+                    altName := (key = "Value") ? sect : key
+                    ctrl := MainGui[altName]
+                    value := (ctrl.Type = "ComboBox") ? ctrl.Text : ctrl.Value
+                } catch {
+                    ; 没控件就用现有配置里的值
                     value := config.data[sect][key]
+                }
             }
-            if ( not value and key != "GamePath" and key != "WhiteList") {
-                MsgBox(t("配置项不能为空: ") sect ">>" key " " MainGui[key == "Value" ? sect : key].Type)
+
+            ; 允许为空的键（避免不必要的“不能为空”提示）
+            emptyOk :=
+                (sect = "Global" && (key = "GamePath" || key = "WhiteList"))     ; 你原来的两个例外
+                || (sect = "Follow" && (key = "TimeOutIdsList" || key = "PriorityList"))  ; 新增：名单页俩列表可为空
+
+            ; 如果不允许为空，就直接报错（不要访问不存在的控件）
+            if (value = "" && !emptyOk) {
+                ; MsgBox(t("配置项不能为空: ") sect " >> " key)
                 return
             }
+
+            ; 写回配置
             config.data[sect][key] := value
         }
     }
     config.Save()
     config.UpdateDllConfig()
 }
+
 ; 获取URL响应内容 - 改进版本
 GetUrlResponse(url, timeout := 10000) {
     try {
@@ -927,6 +1491,7 @@ SelectAction(GuiCtrlObj, Info := unset) {
     MainGui["AutoPotion"].Enabled := true
     try MainGui["AutoPotion"].Value := theGame.setting["Features"]["AutoPotion"]
     try MainGui["AutoPotionCfg"].Enabled := true
+    try MainGui["FollowTargetCfgBtn"].Enabled := true
 
     for key in ["Animation", "BlindMode", "Attack", "Breakblocks", "ByPass", "ClipCam", "Dismount", "Health", "LockCam",
         "Map", "Mining", "MiningGeode", "NoClip", "UseLog", "Zoom"] {
@@ -1141,9 +1706,10 @@ FollowTarget(GuiCtrlObj, Info) {
             GuiCtrlObj.Value := false
             return
         }
+        SyncFollowToDll()
     }
 
-    for key in ["PlayerName", "TargetName", "TargetBoss", "TargetList", "ScanAll", "BossLevel"]
+    for key in ["PlayerName", "TargetName", "TargetBoss", "TargetList", "ScanAll"]
         MainGui["FollowTarget_" key].Enabled := !GuiCtrlObj.Value
     theGame := Game.Lists[MainGui["SelectGame"].Text]
     theGame.setting["FollowTarget"]["On"] := GuiCtrlObj.Value
@@ -1175,13 +1741,6 @@ SpeedUp(GuiCtrlObj, Info) {
 SomeUiSetChangeEvent(GuiCtrlObj, Info) {
     kv := StrSplit(GuiCtrlObj.Name, "_")
     Game.Lists[MainGui["SelectGame"].Text].setting[kv[1]][kv[2]] := GuiCtrlObj.Value
-    if (kv[1] == "FollowTarget" && kv[2] == "BossLevel") {
-        val := GuiCtrlObj.Value
-        if (val = "" || val < 0)
-            val := 4
-        ; 传给 DLL：Module::bossLevel
-        UpdateConfig("Module::bossLevel", String(val))
-    }
 }
 
 ; 核心类
@@ -1249,7 +1808,9 @@ class _Config {
         this.path := path
         this.data := data
     }
+
     UpdateDllConfig() {
+        ; ===== 维持你原来“特性/地址/偏移”的下发 =====
         UpdateConfig("Module::Feature::hideAnimation", this.data["Address"]["Animation"] "|-|-|-")
         UpdateConfig("Module::Feature::autoAttack", this.data["Address"]["Attack"] "|-|-|-")
         UpdateConfig("Module::Feature::breakBlocks", this.data["Address"]["Breakblocks"] "|-|-|-")
@@ -1262,10 +1823,59 @@ class _Config {
         UpdateConfig("Module::Feature::quickMiningGeode", this.data["Address"]["MiningGeode"] "|-|-|-")
         UpdateConfig("Module::Feature::noClip", this.data["Address"]["NoClip"] "|-|-|-")
         UpdateConfig("Module::Feature::unlockZoomLimit", this.data["Address"]["Zoom"] "|-|-|-")
+
         UpdateConfig("Game::Player::offsets", this.data["Address"]["Player"] "|0x0")
         UpdateConfig("Game::Player::Fish::offsets", this.data["Address"]["Fish"] "|0x68|0x0")
         UpdateConfig("Game::World::offsets", this.data["Address"]["World"] "|0x0")
+
+        ; ===== 新增：把“跟随设置(Follow)”也统一下发到 DLL =====
+        flw := this.data["Follow"]
+
+        ; —— 基础参数 ——（模块里用来控制寻路/高度/步长等）
+        UpdateConfig("Module::bossLevel", flw.Has("BossLevel") ? flw["BossLevel"] : "4")
+        UpdateConfig("Module::tpStep", flw.Has("TpStep") ? flw["TpStep"] : "4")
+        UpdateConfig("Module::mapWidth", flw.Has("MapWidth") ? flw["MapWidth"] : "4300")
+        UpdateConfig("Module::entityScand", flw.Has("EntityScand") ? flw["EntityScand"] : "100")
+        UpdateConfig("Module::maxY", flw.Has("MaxY") ? flw["MaxY"] : "200")
+        UpdateConfig("Module::minY", flw.Has("MinY") ? flw["MinY"] : "-45")
+
+        aox := flw.Has("AimOffsetX") ? flw["AimOffsetX"] : "1.25"
+        aoy := flw.Has("AimOffsetY") ? flw["AimOffsetY"] : "0.25"
+        UpdateConfig("Module::aimOffset", aox "|" aoy)
+
+        ; —— 自动宝箱名单 ——（开关 + 等待窗口 + 列表）
+        priOn := flw.Has("PriorityOn") ? flw["PriorityOn"] : "1"
+        pWait := flw.Has("priorityChestWaitMs") ? flw["priorityChestWaitMs"] : "500"
+        pList := flw.Has("PriorityList") ? flw["PriorityList"] : ""
+        UpdateConfig("Module::priorityChestWaitMs", (priOn = "1") ? pWait : "0")
+        UpdateConfig("Module::priorityChests", StrLen(pList) ? pList : " ")
+
+        ; —— 临时黑名单 ——（开关 + 列表）
+        toOn := flw.Has("TimeOutIdsOn") ? flw["TimeOutIdsOn"] : "1"
+        ; toList := flw.Has("TimeOutIdsList") ? flw["TimeOutIdsList"] : ""
+        ; UpdateConfig("Module::timeOutIds", StrLen(toList) ? toList : " ")
+        UpdateConfig("Module::timeOutIdsEnabled", (toOn = "1") ? "true" : "false")
+
+        ; ---- 自动拾取 ----
+        clw := flw.Has("chestLootWaitMs") ? flw["chestLootWaitMs"] : "0"
+        UpdateConfig("Module::chestLootWaitMs", clw)
+
+        ; ---- 超时阈值（普通/5*）----
+        toN := flw.Has("timeoutBlacklistMs") ? flw["timeoutBlacklistMs"] : "60000"
+        to5 := flw.Has("timeoutBlacklistMs5star") ? flw["timeoutBlacklistMs5star"] : "240000"
+        UpdateConfig("Module::timeoutBlacklistMs", toN)
+        UpdateConfig("Module::timeoutBlacklistMs5star", to5)
+
+        ; —— 短暂停滞 ——（减少卡住时的推进行为）
+        sso := flw.Has("ShortStallOn") ? flw["ShortStallOn"] : "0"
+        UpdateConfig("Module::shortStallOn", sso)
+        ; ---- 短暂停滞 规则 ----
+        rules := flw.Has("ShortStallRules") ? flw["ShortStallRules"] : ""
+        UpdateConfig("Module::shortStallRules", StrLen(rules) ? rules : " ")
+
     }
+
+    ; 下面保持你的其它方法不变：Load/Save/Update ...
     Load(path := unset) {
         path := IsSet(path) ? path : this.path
         if ((NewConfigVersion := IniRead(path, "Global", "ConfigVersion", this.data["Global"]["ConfigVersion"])) <
@@ -1300,14 +1910,17 @@ class _Config {
         if ( not hasDefault)
             _Language.SupportLanguage.Push(_Language.DefaultLanguage)
 
+        ; 关键：Load() 结束时就把当前 config 全量下发（含 Follow）
         this.UpdateDllConfig()
     }
+
     Save(path := unset) {
         path := IsSet(path) ? path : this.path
         for sect, data in this.data
             for key, value in data
                 IniWrite(this.data[sect][key], path, sect, key)
     }
+
     Update(url) {
         try {
             Download(url, TempPath := A_Temp "\TroveAutoConfig.ini")
@@ -1316,15 +1929,15 @@ class _Config {
                 NewAppVersion := IniRead(TempPath, "Global", "AppVersion")
                 OldAppVersion := this.data["Global"]["AppVersion"]
                 this.Load(TempPath)
-                MsgBox(Format(t("配置版本 {1} => {2} 已完成{3}"), OldConfigVersion, NewConfigVersion,
-                NewAppVersion > OldAppVersion ? Format(t("`n警告: 程序本体存在最新版本 {1} => {2}"), OldAppVersion, NewAppVersion) :
-                    ""))
+                MsgBox(Format(t("配置版本 {1} => {2} 已完成{3}"), OldConfigVersion, NewConfigVersion
+                , NewAppVersion > OldAppVersion ? Format(t("`n警告: 程序本体存在最新版本 {1} => {2}"), OldAppVersion, NewAppVersion
+                ) : ""))
+            } else {
+                MsgBox(t("当前已是最新版本"))
             }
-            else MsgBox(t("当前已是最新版本"))
-        }
-        catch
+        } catch {
             return false
-        else return true
+        } else return true
     }
 }
 
@@ -1558,8 +2171,7 @@ class Game {
             "TargetName", "",
             "TargetBoss", false,
             "TargetList", false,
-            "ScanAll", false,
-            "BossLevel", 6,
+            "ScanAll", false
         ),
         "SpeedUp", Map(
             "On", false,
@@ -1788,68 +2400,6 @@ class Game {
             return false
         }
     }
-
-    ; HealthMonitor() {
-    ;     static lastHp := -1
-    ;     static lastDrinkTick := 0
-
-    ;     ; ---- 读配置（每次读，保证热更新）----
-    ;     minIntervalMs := Integer(config.data["AutoPotion"]["MinIntervalMs"])  ; 毫秒
-    ;     stopAtCount := Integer(config.data["AutoPotion"]["StopAtCount"])    ; ≤N 则停止
-
-    ;     if !(this.HasFeature("Health") || this.HasFeature("AutoPotion"))
-    ;         return
-
-    ;     ; 1) 读 HP
-    ;     currentHp := this.ReadMemory(
-    ;         this.GetAddressOffset(
-    ;             this.BaseAddress + config.data["Address"]["Player"],
-    ;             StrSplit(config.data["Address_Offset"]["Player_Health"], ",")
-    ;         ), "Double", 8
-    ;     )
-    ;     ; logger.debug(Format("HP={}", currentHp))
-
-    ;     ; 2) 用药逻辑（血量下降触发 + 冷却 + 库存下限）
-    ;     if (this.HasFeature("AutoPotion")) {
-    ;         if (lastHp != -1 && currentHp < lastHp) {
-    ;             now := A_TickCount
-    ;             ; （可选）查询库存；返回 "" 表示读不到
-    ;             ; cnt := this.PotionCount(this.pid, this.BaseAddress, this.ProcessHandle, config.data[
-    ;             ;     "Address_Offset_Signature"]["Use_Q"])
-    ;             cnt := 10
-    ;             ; logger.debug(Format("PotionCount={}", cnt))
-    ;             if (cnt != "" && stopAtCount > 0 && cnt <= stopAtCount) {
-    ;                 logger.warn(Format("药瓶余量 {} ≤ 停止阈值 {}，不再使用。", cnt, stopAtCount))
-    ;             } else if (now - lastDrinkTick >= minIntervalMs) {
-    ;                 this.NatualPress("Q")
-    ;                 lastDrinkTick := now
-    ;                 if (cnt != "")
-    ;                     logger.info(Format("触发自动药瓶（剩余约 {} ）", cnt))
-    ;             } else {
-    ;                 ; 冷却中，不喝
-    ;                 ; logger.trace("药瓶处于冷却中，跳过")
-    ;             }
-    ;         }
-    ;     }
-
-    ;     ; 3) 复活逻辑
-    ;     if (this.HasFeature("Health")) {
-    ;         if (currentHp <= 0) {
-    ;             ; 确保 DLL 的 SetAutoRespawn 已经在跑（避免重复启动，跑着就行）
-    ;             if (!this.threads.Has("AutoRespawn")) {
-    ;                 this.threads["AutoRespawn"] := Map("STOP", false)
-    ;                 ; delay=50ms 可调，你 DLL 里默认 50 也行
-    ;                 FunctionOn(this.pid, "SetAutoRespawn", "50", false)
-    ;                 logger.info("已通知 DLL：监控自动复活(SetAutoRespawn)")
-    ;             }
-    ;             ; 等待 DLL 回调 EVT_RESP_CAN_REVIVE 后，AhkEventSink 会自动按键
-    ;             return
-    ;         }
-    ;     }
-
-    ;     ; 4) 更新 lastHp
-    ;     lastHp := currentHp
-    ; }
 
     Features(Name, Value) {
         switch Name {

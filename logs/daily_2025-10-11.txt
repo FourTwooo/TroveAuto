@@ -1,0 +1,4 @@
+[2025-10-11 16:52:01] [thread  9496  ] [  info  ] | 跟随设置已保存：boss=4, tpStep=3, mapWidth=4299, entityScand=98, maxY=200, minY=-45, aimOffset=(1.25, 0.25) 
+[2025-10-11 17:02:13] [thread  8968  ] [  info  ] | 跟随设置已保存：boss=4, tpStep=1, mapWidth=4300, entityScand=98, maxY=200, minY=-45, aimOffset=(1.25, 0.25) 
+[2025-10-11 17:02:19] [thread  8968  ] [  info  ] | 跟随设置已保存：boss=6, tpStep=1, mapWidth=4300, entityScand=98, maxY=200, minY=-45, aimOffset=(1.25, 0.25) 
+[2025-10-11 17:23:02] [thread  13212 ] [  info  ] | 跟随设置已保存：boss=6, tpStep=1, mapWidth=4300, entityScand=98, maxY=200, minY=-45, aimOffset=(1.25, 0.25) 

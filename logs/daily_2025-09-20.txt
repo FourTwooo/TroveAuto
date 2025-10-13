@@ -1,0 +1,9 @@
+[2025-09-20 14:12:06] [thread  14324 ] [  info  ] | [AutoRespawn] emit EVT_RESP_CAN_REVIVE (now) 
+[2025-09-20 14:12:12] [thread  14324 ] [  info  ] | [AutoRespawn] emit EVT_RESP_CAN_REVIVE (now) 
+[2025-09-20 14:12:12] [thread  14324 ] [  info  ] | [当前世界ID] => 0 
+[2025-09-20 14:12:18] [thread  14324 ] [warning ] | [玩家死亡] 等待复活... 
+[2025-09-20 14:12:18] [thread  14324 ] [  info  ] | [AutoRespawn] emit EVT_RESP_CAN_REVIVE (byFollow) 
+[2025-09-20 14:12:25] [thread  14324 ] [warning ] | [玩家死亡] 等待复活... 
+[2025-09-20 14:12:25] [thread  14324 ] [  info  ] | [AutoRespawn] emit EVT_RESP_CAN_REVIVE (byFollow) 
+[2025-09-20 14:12:32] [thread  14324 ] [  info  ] | [AutoRespawn] emit EVT_RESP_CAN_REVIVE (now) 
+[2025-09-20 14:12:41] [thread  14324 ] [  info  ] | [AutoRespawn] emit EVT_RESP_CAN_REVIVE (now) 

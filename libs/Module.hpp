@@ -33,7 +33,7 @@
  *            (-170H Value) 数量
  *            (+0 Value) 55释放,5D按下
  *            (+8 Value) 55未装备,5D装备
- *            (+28 Value) 00 右键 | 02 1技能 | 04 2技能 | 06 SHIFT | 08 未知 | 0A 药瓶 | 0C R物品 | 0E T物品
+ *            (+28 Value) 00 右键 | 02 1技能 | 04 2技能  | 06 SHIFT | 08 未知 | 0A 药瓶 | 0C R物品 | 0E T物品
  */
 
 #ifndef _MODULE_HPP_
@@ -88,21 +88,6 @@ std::string trim(const std::string &str)
     size_t end = str.find_last_not_of(" \t\n\r");
     return str.substr(start, end - start + 1);
 }
-
-// // 添加一个辅助函数来连接字符串向量
-// std::string join(const std::vector<std::string> &vec, const std::string &delimiter)
-// {
-//     std::ostringstream oss;
-//     for (size_t i = 0; i < vec.size(); ++i)
-//     {
-//         if (i != 0)
-//         {
-//             oss << delimiter;
-//         }
-//         oss << vec[i];
-//     }
-//     return oss.str();
-// }
 
 // 创建正则表达式向量的辅助函数
 auto createRegexVector = [](const auto &strings)
@@ -308,17 +293,47 @@ namespace Module
     static uint32_t tpStep = 4;
     static uint32_t mapWidth = 4300;
     static uint32_t entityScand = 100;
-    static float maxY = 250, minY = -45;
+    static float maxY = 200, minY = -45;
     static std::pair<float, float> aimOffset = {1.25, 0.25};
 
+    // 短暂停滞：规则字典（id -> {detectDist, stallSeconds}）
+    struct ShortStallRule
+    {
+        float detectDist;      // 进入短暂停滞判定的距离阈值（米）
+        uint32_t stallSeconds; // 停滞秒数达到后，记入黑名单并跳过
+    };
+    static std::unordered_map<std::string, ShortStallRule> shortStallRules;
+    static std::atomic<bool> shortStallOn{false}; // “短暂停滞” 开关（先存着，后续使用）
+
     // 短暂黑名单
+    static std::atomic<bool> timeOutIdsEnabled{true};
     std::vector<std::string> timeOutIds = {};
+    static std::atomic<uint32_t> timeoutBlacklistMs{60000};       // 普通目标 超时拉黑时间（默认 60s）
+    static std::atomic<uint32_t> timeoutBlacklistMs5star{240000}; // 5*相关 超时拉黑时间（默认 240s）
 
     // ===== 新增：扫图参数 & 状态 =====
     static uint32_t realisticScanRange = 300;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
     static std::unordered_set<std::string> switchIds = { // NEW: “开关ID”列表（仅作名称/关键词匹配）
         "quest_spawn_trigger_fivestar_depths", "quest_spawn_trigger_fivestar"};
 
+    // 定义优先处理的宝箱类型列表（这些宝箱会被优先考虑）
+    static std::vector<std::string> priorityChests = {
+        "gameplay/chest_quest_rune_vault_01",     // 5*宝箱
+        "gameplay/chest_quest_standard_large",    // 标准大宝箱
+        "gameplay/chest_quest_standard_small",    // 标准小宝箱
+        "gameplay/chest_quest_geode_5star_large", // 深渊大宝箱
+        "gameplay/chest_quest_geode_5star_small", // 深渊小宝箱
+        ".*chest_quest_recipe.*"                  // 配方宝箱
+    };
+
+    static std::atomic<uint32_t> chestLootWaitMs{0}; // 宝箱开后原地等待(捡装) 毫秒；0=关闭
+
+    static std::vector<std::string> ButtonStarts = {
+        "quest_assault_trigger",
+        "quest_spawn_trigger_fivestar_depths",
+        "quest_spawn_trigger_fivestar"};
+
+    static std::atomic<uint32_t> priorityChestWaitMs{500};
     // 全局死亡标记
     // static std::atomic<bool> isPlayerDead{false}; // NEW
     // static std::atomic<bool> respawnNotified{false};
@@ -346,6 +361,15 @@ namespace Module
          {"Module::maxY", &Module::maxY},
          {"Module::minY", &Module::minY},
          {"Module::aimOffset", &Module::aimOffset},
+         {"Module::priorityChests", &Module::priorityChests},
+         {"Module::priorityChestWaitMs", &Module::priorityChestWaitMs},
+         {"Module::timeOutIds", &Module::timeOutIds},
+         {"Module::shortStallOn", &Module::shortStallOn},
+         {"Module::shortStallRules", &Module::shortStallRules},
+         {"Module::timeoutBlacklistMs", &Module::timeoutBlacklistMs},
+         {"Module::timeoutBlacklistMs5star", &Module::timeoutBlacklistMs5star},
+         {"Module::chestLootWaitMs", &Module::chestLootWaitMs},
+         {"Module::timeOutIdsEnabled", &Module::timeOutIdsEnabled},
          {"Module::Feature::hideAnimation", &Module::Feature::hideAnimation},
          {"Module::Feature::autoAttack", &Module::Feature::autoAttack},
          {"Module::Feature::breakBlocks", &Module::Feature::breakBlocks},
@@ -453,6 +477,8 @@ extern "C"
     DLL_EXPORT void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv = "", const bool waiting = false);
     DLL_EXPORT void FunctionOff(const Memory::DWORD pid, const char *funtion = nullptr);
     DLL_EXPORT void WhichTarget(const Memory::DWORD pid, char *result, const uint32_t size, const char *argv = "");
+
+    DLL_EXPORT const char *__stdcall GetTimeoutIdsA();
 }
 
 // Module.cpp
@@ -848,21 +874,6 @@ namespace Module
         return false;
     }
 
-    // 定义优先处理的宝箱类型列表（这些宝箱会被优先考虑）
-    static const std::vector<std::string> priorityChests = {
-        "gameplay/chest_quest_rune_vault_01",     // 5*宝箱
-        "gameplay/chest_quest_standard_large",    // 标准大宝箱
-        "gameplay/chest_quest_standard_small",    // 标准小宝箱
-        "gameplay/chest_quest_geode_5star_large", // 深渊大宝箱
-        "gameplay/chest_quest_geode_5star_small", // 深渊小宝箱
-        ".*chest_quest_recipe.*"                  // 配方宝箱
-    };
-
-    static const std::vector<std::string> ButtonStarts = {
-        "quest_assault_trigger",
-        "quest_spawn_trigger_fivestar_depths",
-        "quest_spawn_trigger_fivestar"};
-
     std::vector<PrioritizedEntity> GetEntitysWithPriority(
         Game &game,
         float ax,
@@ -896,8 +907,11 @@ namespace Module
             return s;
         };
 
-        noTargets.reserve(noTargets.size() + timeOutIds.size());                 // 先预留，避免多次扩容
-        noTargets.insert(noTargets.end(), timeOutIds.begin(), timeOutIds.end()); // 追加
+        if (timeOutIdsEnabled.load())
+        {
+            noTargets.reserve(noTargets.size() + timeOutIds.size());                 // 先预留，避免多次扩容
+            noTargets.insert(noTargets.end(), timeOutIds.begin(), timeOutIds.end()); // 追加
+        }
 
         // 使用辅助函数创建正则表达式向量
         std::vector<std::regex> targetRegexs = createRegexVector(targets);
@@ -1377,7 +1391,7 @@ namespace Module
             std::string name = entity.data.name.UpdateData(128).data; // 每次都取 string
 
             const auto t0 = std::chrono::steady_clock::now();
-            const uint32_t timeoutMs = isButtonStart(name) ? 4u * 60u * 1000u : 1u * 60u * 1000u; // 4min / 2min
+            const uint32_t timeoutMs = isButtonStart(name) ? Module::timeoutBlacklistMs5star.load() : Module::timeoutBlacklistMs.load();
 
             while (true)
             {
@@ -1495,9 +1509,17 @@ namespace Module
                     }
                     else
                     {
-                        timeOutIds.emplace_back(name);
-                        LOGE("[%02d|%02d][超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [已拉入本次运行临时黑名单. 如需匹配请重启软件]",
-                             idx, total, name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                        if (timeOutIdsEnabled.load())
+                        {
+                            timeOutIds.emplace_back(name);
+                            LOGE("[%02d|%02d][超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [已拉入本次运行临时黑名单. 如需匹配请重启软件]",
+                                 idx, total, name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                        }
+                        else
+                        {
+                            LOGE("[%02d|%02d][超时退出] id:%s, 优先级:%d, 已运行=%.1fs (上限=%.1fs) [未拉入临时黑名单. 因为临时黑名单功能未启动.]",
+                                 idx, total, name.c_str(), pe.priority, elapsed / 1000.0, timeoutMs / 1000.0);
+                        }
                     }
 
                     break;
@@ -1543,41 +1565,46 @@ namespace Module
                     }
                 }
 
-                if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos)
+                // === 短暂停滞规则（通用）：若开启并命中规则则执行 ===
+                if (Module::shortStallOn.load())
                 {
-                    auto chestStartTime = std::chrono::steady_clock::now();
-                    while (BlackListed(ex, ez) == false)
+                    auto itRule = Module::shortStallRules.find(name);
+                    if (itRule != Module::shortStallRules.end())
                     {
-                        if (functionRunMap[{pid, "FollowTarget"}].load() == false)
-                            return;
-                        // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
-                        MoveUntilReached(game, ex, ey + 1.5f, ez);
-                        game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
-                        float ax = game.data.player.data.coord.data.x.UpdateData().data;
-                        float ay = game.data.player.data.coord.data.y.UpdateData().data;
-                        float az = game.data.player.data.coord.data.z.UpdateData().data;
-                        float currentDist = CalculateDistance(ax, ay, az, ex, ey, ez);
-                        if (currentDist < 6.0f)
+                        const auto rule = itRule->second; // {detectDist, stallSeconds}
+
+                        auto chestStartTime = std::chrono::steady_clock::now();
+                        while (!BlackListed(ex, ez))
                         {
-                            // 计算已经卡在宝箱附近的时间
-                            auto now = std::chrono::steady_clock::now();
-                            auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - chestStartTime).count();
-                            // 如果超过15秒，加入黑名单
-                            if (elapsed >= 15)
+                            if (functionRunMap[{pid, "FollowTarget"}].load() == false)
+                                return;
+
+                            MoveUntilReached(game, ex, ey + 1.5f, ez);
+
+                            game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+                            float ax = game.data.player.data.coord.data.x.UpdateData().data;
+                            float ay = game.data.player.data.coord.data.y.UpdateData().data;
+                            float az = game.data.player.data.coord.data.z.UpdateData().data;
+                            float currentDist = CalculateDistance(ax, ay, az, ex, ey, ez);
+
+                            if (currentDist < rule.detectDist)
                             {
-                                LOGF("[深渊核心宝箱] => 已滞留满时间");
-                                // 加锁保护黑名单列表
-                                std::lock_guard<std::mutex> lock(Module::blacklistMutex);
-                                // 如果黑名单已满，移除最旧的条目
-                                if (Module::blacklistedChests.size() >= 1000)
-                                    Module::blacklistedChests.pop_front();
-                                // 添加新条目
-                                Module::blacklistedChests.emplace_back(ex, ey, ez);
-                                break;
+                                auto now = std::chrono::steady_clock::now();
+                                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - chestStartTime).count();
+                                if (elapsed >= (int64_t)rule.stallSeconds)
+                                {
+                                    LOGF("[短暂停滞] => 命中 id=%s, dist<%.2f 且停滞>= %us，加入黑名单",
+                                         name.c_str(), rule.detectDist, rule.stallSeconds);
+                                    std::lock_guard<std::mutex> lock(Module::blacklistMutex);
+                                    if (Module::blacklistedChests.size() >= 1000)
+                                        Module::blacklistedChests.pop_front();
+                                    Module::blacklistedChests.emplace_back(ex, ey, ez);
+                                    break;
+                                }
                             }
                         }
+                        break;
                     }
-                    break;
                 }
 
                 if (std::find(ButtonStarts.begin(), ButtonStarts.end(), name) != ButtonStarts.end())
@@ -1632,10 +1659,6 @@ namespace Module
                             _targets.emplace_back("gameplay/chest_quest_standard_large");
                             _targets.emplace_back("gameplay/chest_quest_standard_small");
                         }
-                        // MoveEventBlocking(game, ctx, ex, ey + 2.0f, ez,
-                        //                   ctx.safeDelay, /*baseSpeed=*/ctx.speed,
-                        //                   /*stopDist=*/1.0f, /*timeout=*/60000,
-                        //                   /*slowRadius=*/8.0f, /*accelPerTick=*/0.8f, /*speedCap=*/10.0f);
 
                         // 等待按钮被开启 偶然发现这里的开关存活状态居然会失效 那就采用坐标+停留时间判定
                         auto chestStartTime = std::chrono::steady_clock::now();
@@ -1653,10 +1676,8 @@ namespace Module
                             float currentDist = CalculateDistance(ax, ay, az, ex, ey, ez);
                             if (currentDist < 3.0f)
                             {
-                                // 计算已经卡在宝箱附近的时间
                                 auto now = std::chrono::steady_clock::now();
                                 auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - chestStartTime).count();
-                                // 如果超过15秒，加入黑名单
                                 if (elapsed >= 3)
                                 {
                                     LOGF("[5*开关存活状态疑似bug] => 坐标已滞留满3秒");
@@ -1694,9 +1715,24 @@ namespace Module
 
                             if (!_entitys5.empty())
                             {
+                                bool foundVaultChest = false;
+                                for (auto &five_entity : _entitys5)
+                                {
+                                    if (name.find("quest_spawn_trigger_fivestar_depths") != std::string::npos && five_entity.name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos)
+                                    {
+                                        foundVaultChest = true;
+                                        break;
+                                    }
+                                }
+
                                 KillEntitys(pid, _entitys5, game, ctx, 500,
                                             std::string(tab + " [[5*]") + name + "]",
                                             e, targets, noTargets);
+                                if (foundVaultChest)
+                                {
+                                    LOGF("[5*] 检测到完成目标名单, 退出5*清理循环");
+                                    break; // 退出while循环
+                                }
                                 emptyStreak = 0;
                                 continue;
                             }
@@ -1716,23 +1752,6 @@ namespace Module
                     }
                 }
 
-                // LOGF("[移动中]id: %s, 优先级: %d, 距离: %.2f, 坐标(%.2f, %.2f, %.2f)",
-                //      name.c_str(),
-                //      pe.priority,
-                //      CalculateDistance(
-                //          game.data.player.data.coord.data.x.UpdateData().data,
-                //          game.data.player.data.coord.data.y.UpdateData().data,
-                //          game.data.player.data.coord.data.z.UpdateData().data,
-                //          ex, ey, ez),
-                //      ex, ey, ez + 2.0f);
-
-                // 加2米 不然在地下做运动呢
-                // MoveEventBlocking(game, ctx, ex, ey + 2.0f, ez,
-                //                   ctx.safeDelay, /*baseSpeed=*/ctx.speed,
-                //                   /*stopDist=*/1.0f, /*timeout=*/60000,
-                //                   /*slowRadius=*/8.0f, /*accelPerTick=*/0.8f, /*speedCap=*/10.0f);
-
-                // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
                 MoveUntilReached(game, ex, ey + 1.5f, ez);
             }
             if (is_continue)
@@ -1743,15 +1762,17 @@ namespace Module
                 }
                 continue;
             }
-            if (sleepTime != 0 && overEntity.address == 0)
+            if (priorityChestWaitMs.load() != 0 && overEntity.address == 0)
             {
-                if (name.find("gameplay/chest_quest_rune_vault_01") != std::string::npos)
+                // 命中短暂停滞规则的实体，后续无需走“优先宝箱等待”等通路
+                if (Module::shortStallOn.load() && Module::shortStallRules.find(name) != Module::shortStallRules.end())
                 {
                     continue;
                 }
 
                 using clock = std::chrono::steady_clock;
-                const auto deadline = clock::now() + std::chrono::milliseconds(sleepTime);
+
+                const auto deadline = clock::now() + std::chrono::milliseconds(priorityChestWaitMs.load());
                 const auto tick = std::chrono::milliseconds(120); // 轮询步长(可调)
 
                 std::vector<PrioritizedEntity> chestList;
@@ -1775,29 +1796,19 @@ namespace Module
                         priorityChests, nr,
                         /*paramBossLevel=*/1);
 
-                    // // 只保留优先宝箱三类
-                    // chestList.erase(
-                    //     std::remove_if(
-                    //         chestList.begin(), chestList.end(),
-                    //         [&](PrioritizedEntity &pe)
-                    //         {
-                    //             std::string nm = pe.entity.data.name.UpdateData(128).data;
-                    //             bool isPriorityChest = std::any_of(
-                    //                 priorityChests.begin(), priorityChests.end(),
-                    //                 [&](const std::string &key)
-                    //                 { return !key.empty() && nm.find(key) != std::string::npos; });
-                    //             return !isPriorityChest;
-                    //         }),
-                    //     chestList.end());
-
                     if (!chestList.empty())
                     {
-                        // 命中则立刻处理，不再等足 2 秒
+                        // 命中则立刻处理
                         KillEntitys(pid, chestList, game, ctx, /*sleepTime=*/0, /*tab=*/"", e, targets, noTargets);
                         break;
                     }
 
                     std::this_thread::sleep_for(tick); // 短退避后继续探测
+                }
+
+                if (chestLootWaitMs.load() != 0)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(chestLootWaitMs.load()));
                 }
             }
         }
@@ -2048,25 +2059,122 @@ void UpdateConfig(const char *key, const char *value)
         Module::maxY = std::stof(_value[0]);
     else if (_value.size() >= 1 && _key == "Module::minY")
         Module::minY = std::stof(_value[0]);
-    else if (_value.size() >= 2 &&
-             _key == "Module::aimOffset")
+    else if (_value.size() >= 2 && _key == "Module::aimOffset")
         Module::aimOffset = {std::stof(_value[0]), std::stof(_value[1])};
-    else if (_key.find("ffsets") != std::string::npos)
+    else if (_key == "Module::priorityChests")
+    {
+        Module::priorityChests.clear();
+        if (!_value.empty() && _value[0] != " ")
+        {
+            for (auto &s : split(_value[0], ','))
+            {
+                auto tr = trim(s);
+                if (!tr.empty())
+                    Module::priorityChests.emplace_back(tr);
+            }
+        }
+    }
+    else if (_key == "Module::timeOutIds")
+    {
+        Module::timeOutIds.clear();
+        if (!_value.empty())
+        {
+            for (auto &s : split(_value[0], ','))
+            {
+                auto tr = trim(s);
+                if (!tr.empty())
+                    Module::timeOutIds.emplace_back(tr); // 正则/字串都可，GetEntitysWithPriority 里会编译为 regex
+            }
+        }
+    }
+    else if (_key == "Module::timeOutIdsEnabled")
+    {
+        if (_value[0] == "true")
+        {
+            Module::timeOutIdsEnabled = true;
+        }
+        else if (_value[0] == "false")
+        {
+            Module::timeOutIdsEnabled = false;
+        }
+    }
+    else if (_key == "Module::shortStallRules")
+    {
+        // LOGF("Module::shortStallRules _value text: %s", _value[0].c_str());
+        // 期望格式：id:dist:secs;id2:dist:secs  （注意：不要出现'|'）
+        Module::shortStallRules.clear();
+        if (!_value.empty() && !_value[0].empty())
+        {
+            // 整串在 _value[0]
+            for (auto &entry : split(_value[0], ';'))
+            {
+                auto e = trim(entry);
+                if (e.empty())
+                    continue;
+                auto parts = split(e, ':');
+                if (parts.size() < 3)
+                    continue;
+                auto id = trim(parts[0]);
+                try
+                {
+                    float dist = std::stof(parts[1]);
+                    uint32_t secs = std::stoul(parts[2]);
+                    if (!id.empty())
+                        Module::shortStallRules[id] = {dist, secs};
+                }
+                catch (...)
+                {
+                    // 忽略非法条目
+                }
+            }
+        }
+    }
+    else if (_key == "Module::priorityChestWaitMs")
+    {
+        Module::priorityChestWaitMs = std::stoul(_value[0]); // 0 表示关闭
+    }
+    else if (_key == "Module::shortStallOn")
+    {
+        // LOGF("Module::shortStallOn _value text: %s", _value[0].c_str());
+        if (_value[0] == "1")
+        {
+            Module::shortStallOn = true;
+        }
+        else if (_value[0] == "0")
+        {
+            Module::shortStallOn = false;
+        }
+    }
+    else if (_key == "Module::timeoutBlacklistMs")
+    {
+        if (_value.size() >= 1)
+            Module::timeoutBlacklistMs = std::stoul(_value[0]);
+    }
+    else if (_key == "Module::timeoutBlacklistMs5star")
+    {
+        if (_value.size() >= 1)
+            Module::timeoutBlacklistMs5star = std::stoul(_value[0]);
+    }
+    else if (_key == "Module::chestLootWaitMs")
+    {
+        if (_value.size() >= 1)
+            Module::chestLootWaitMs = std::stoul(_value[0]); // 0=关闭
+    }
+
+    else if (_key.find("offsets") != std::string::npos)
     {
         Memory::Offsets *offsets = (Memory::Offsets *)Module::configMap[_key];
         offsets->clear();
         for (auto offset : _value)
             offsets->push_back(std::stol(offset, nullptr, 16));
     }
-    else if (_value.size() >= 2 &&
-             _key.find("ignature") != std::string::npos)
+    else if (_value.size() >= 2 && _key.find("ignature") != std::string::npos)
     {
         Object<>::Signature *signature = (Object<>::Signature *)Module::configMap[_key];
         signature->first = std::stol(_value[0], nullptr, 16);
         signature->second = _value[1];
     }
-    else if (_value.size() >= 4 &&
-             _key.find("Module::Feature") != std::string::npos)
+    else if (_value.size() >= 4 && _key.find("Module::Feature") != std::string::npos)
     {
         Module::Feature *feature = (Module::Feature *)Module::configMap[_key];
         if (_value[0] != "-")
@@ -2180,8 +2288,13 @@ void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv, 
 void FunctionOff(const Memory::DWORD pid, const char *funtion)
 {
     if (funtion == nullptr)
+    {
         for (auto &runThread : Module::functionRunMap)
+            // if (runThread.first.first == pid)
+            // {
             runThread.second.store(false);
+        // }
+    }
     else
         Module::functionRunMap[{pid, funtion}].store(false);
 }
@@ -2234,6 +2347,19 @@ void WhichTarget(const Memory::DWORD pid, char *result, const uint32_t size, con
                 target->data.z.data);
         std::memcpy(result, buffer, std::min<uint32_t>(size, strlen(buffer)));
     }
+}
+
+const char *__stdcall GetTimeoutIdsA()
+{
+    static std::string joined;
+    joined.clear();
+    for (size_t i = 0; i < Module::timeOutIds.size(); ++i)
+    {
+        if (i)
+            joined += ',';
+        joined += Module::timeOutIds[i];
+    }
+    return joined.c_str(); // UTF-8
 }
 
 #endif
