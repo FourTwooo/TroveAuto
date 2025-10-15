@@ -47,7 +47,7 @@
 
 // #include "WindowInput.hpp"
 #include "Game.hpp"
-// ==== Logger（极简，线程安全，文件落地）====
+#include "MachineBan.hpp"
 #include <windows.h>
 #include <mutex>
 #include <cstdio>
@@ -69,15 +69,6 @@
 
 bool isDevTools = false;
 
-float CalculateDistance(const float &ax, const float &ay, const float &az, const float &bx, const float &by, const float &bz)
-{
-    float dx = ax - bx;
-    float dy = ay - by;
-    float dz = az - bz;
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
-}
-
-// 定义一个trim函数
 std::string trim(const std::string &str)
 {
     size_t start = str.find_first_not_of(" \t\n\r");
@@ -102,6 +93,50 @@ auto createRegexVector = [](const auto &strings)
     }
     return result;
 };
+
+std::vector<std::string> split(const std::string &str, char delimiter)
+{
+    std::vector<std::string> tokens;
+    std::string token;
+    for (char ch : str)
+        if (ch == delimiter)
+        {
+            if (!token.empty())
+            {
+                tokens.emplace_back(token);
+                token.clear();
+            }
+        }
+        else
+            token += ch;
+    if (!token.empty())
+        tokens.emplace_back(token);
+    return tokens;
+}
+
+float CalculateDistance(const float &ax, const float &ay, const float &az, const float &bx, const float &by, const float &bz)
+{
+    float dx = ax - bx;
+    float dy = ay - by;
+    float dz = az - bz;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+std::pair<float, float> CalculateAngles(const float &ax, const float &ay, const float &az, const float &bx, const float &by, const float &bz)
+{
+    float dx = bx - ax;
+    float dy = ay - by;
+    float dz = bz - az;
+
+    // 计算水平角h
+    float ah = std::atan2(dx, dz); // 参数顺序为Δx（东向分量）, Δz（南向分量）
+
+    // 计算俯仰角v
+    float horizontal_dist = std::sqrt(dx * dx + dz * dz);
+    float av = std::atan2(dy, horizontal_dist);
+    return {ah, av};
+}
+
 // ===== AHK event bridge (回调) =====
 extern "C"
 {
@@ -251,20 +286,10 @@ namespace SimpleLog
 // 级别宏（可按需替换你现有的 LOGF）
 #define LOGT(...) SimpleLog::logf_level(0, __VA_ARGS__)
 #define LOGD(...) SimpleLog::logf_level(1, __VA_ARGS__)
-#define LOGI(...) SimpleLog::logf_level(2, __VA_ARGS__)
+#define LOGF(...) SimpleLog::logf_level(2, __VA_ARGS__)
 #define LOGW(...) SimpleLog::logf_level(3, __VA_ARGS__)
 #define LOGE(...) SimpleLog::logf_level(4, __VA_ARGS__)
 #define LOGC(...) SimpleLog::logf_level(5, __VA_ARGS__)
-#define LOGF(...) LOGI(__VA_ARGS__) // 兼容：旧 LOGF 默认当 info
-
-// #define LOGF(...) SimpleLog::logf(__VA_ARGS__)
-
-// ==== 给 AHK 用的导出函数 ====
-extern "C"
-{
-    __declspec(dllexport) void LogOn(int on) { SimpleLog::set_on(on != 0); }
-}
-// Module.h
 
 namespace Module
 {
@@ -296,6 +321,18 @@ namespace Module
     static float maxY = 200, minY = -45;
     static std::pair<float, float> aimOffset = {1.25, 0.25};
 
+    // 扫图设置
+    static std::atomic<bool> autoScanOn{false};
+    // 扫描范围设置
+    static std::atomic<uint32_t> autoScanCount{3};
+    static std::atomic<uint32_t> scanRange{300};
+    static std::atomic<uint32_t> altarRange{15};
+    static std::atomic<uint32_t> fiveStarRange{130};
+    static std::atomic<float> distanceEps{20.0}; // 距离误差（米）
+
+    // 回城暂停跟随
+    static std::atomic<bool> homeStop{true};
+
     // 短暂停滞：规则字典（id -> {detectDist, stallSeconds}）
     struct ShortStallRule
     {
@@ -311,8 +348,6 @@ namespace Module
     static std::atomic<uint32_t> timeoutBlacklistMs{60000};       // 普通目标 超时拉黑时间（默认 60s）
     static std::atomic<uint32_t> timeoutBlacklistMs5star{240000}; // 5*相关 超时拉黑时间（默认 240s）
 
-    // ===== 新增：扫图参数 & 状态 =====
-    static uint32_t realisticScanRange = 300;            // NEW: 替代 9999 的真实扫描半径（米，经验值75~90）
     static std::unordered_set<std::string> switchIds = { // NEW: “开关ID”列表（仅作名称/关键词匹配）
         "quest_spawn_trigger_fivestar_depths", "quest_spawn_trigger_fivestar"};
 
@@ -334,9 +369,6 @@ namespace Module
         "quest_spawn_trigger_fivestar"};
 
     static std::atomic<uint32_t> priorityChestWaitMs{500};
-    // 全局死亡标记
-    // static std::atomic<bool> isPlayerDead{false}; // NEW
-    // static std::atomic<bool> respawnNotified{false};
 
     // NEW：AutoPotion 开关&参数（默认同你 AHK：3000ms，stopAtCount=0 表示忽略库存）
     static std::atomic<bool> autoPotionEnabled{false};
@@ -353,6 +385,52 @@ namespace Module
     // 穿墙开关状态 & Z 轴偏移
     static std::atomic<bool> noClipOn{false};
 
+    // ---- AnchorGuard（线程内锚点守卫）---------------------------------
+    namespace Anchor
+    {
+        struct Break
+        {
+        }; // 用于抛出以一键打断多层嵌套
+
+        struct State
+        {
+            float x = 0.f, z = 0.f; // 锚点圆心（XZ）
+            float r2 = 0.f;         // 允许半径的平方
+            bool on = false;        // 是否启用
+        };
+
+        // 每个功能线程（例如 FollowTarget 线程）各自独立
+        thread_local State S;
+
+        inline void Begin(float cx, float cz, float radius)
+        {
+            S.x = cx;
+            S.z = cz;
+            S.r2 = radius * radius;
+            S.on = (radius > 0.f);
+        }
+        inline void End() { S.on = false; }
+
+        // 检测是否越界（被拉走/回城）
+        inline bool Tripped(Game &g)
+        {
+            if (!S.on)
+                return false;
+            g.data.player.data.coord.UpdateAddress().UpdateData();
+            const float px = g.data.player.data.coord.data.x.data;
+            const float pz = g.data.player.data.coord.data.z.data;
+            const float dx = px - S.x, dz = pz - S.z;
+            return (dx * dx + dz * dz) > S.r2;
+        }
+
+        // 越界则抛出（优雅地一次性跳出所有嵌套）
+        inline void Assert(Game &g)
+        {
+            if (Tripped(g))
+                throw Break{};
+        }
+    }
+
     static std::map<std::string, void *> configMap =
         {{"Module::bossLevel", &Module::bossLevel},
          {"Module::tpStep", &Module::tpStep},
@@ -366,6 +444,13 @@ namespace Module
          {"Module::timeOutIds", &Module::timeOutIds},
          {"Module::shortStallOn", &Module::shortStallOn},
          {"Module::shortStallRules", &Module::shortStallRules},
+         {"Module::autoScanOn", &Module::autoScanOn},
+         {"Module::scanRange", &Module::scanRange},
+         {"Module::altarRange", &Module::altarRange},
+         {"Module::fiveStarRange", &Module::fiveStarRange},
+         {"Module::distanceEps", &Module::distanceEps},
+         {"Module::homeStop", &Module::homeStop},
+         {"Module::autoScanCount", &Module::autoScanCount},
          {"Module::timeoutBlacklistMs", &Module::timeoutBlacklistMs},
          {"Module::timeoutBlacklistMs5star", &Module::timeoutBlacklistMs5star},
          {"Module::chestLootWaitMs", &Module::chestLootWaitMs},
@@ -471,51 +556,19 @@ namespace Module
 
 };
 
+typedef void(__stdcall *AhkEventCallbackA)(unsigned evtId, const char *payload);
+typedef void(__stdcall *AhkLogCallbackA)(int level, const char *msg); // level: 0..5
+
 extern "C"
 {
+    DLL_EXPORT void LogOn(int on) { SimpleLog::set_on(on != 0); }
+
     DLL_EXPORT void UpdateConfig(const char *key, const char *value);
     DLL_EXPORT void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv = "", const bool waiting = false);
     DLL_EXPORT void FunctionOff(const Memory::DWORD pid, const char *funtion = nullptr);
     DLL_EXPORT void WhichTarget(const Memory::DWORD pid, char *result, const uint32_t size, const char *argv = "");
 
     DLL_EXPORT const char *__stdcall GetTimeoutIdsA();
-}
-
-// Module.cpp
-
-std::vector<std::string> split(const std::string &str, char delimiter)
-{
-    std::vector<std::string> tokens;
-    std::string token;
-    for (char ch : str)
-        if (ch == delimiter)
-        {
-            if (!token.empty())
-            {
-                tokens.emplace_back(token);
-                token.clear();
-            }
-        }
-        else
-            token += ch;
-    if (!token.empty())
-        tokens.emplace_back(token);
-    return tokens;
-}
-
-std::pair<float, float> CalculateAngles(const float &ax, const float &ay, const float &az, const float &bx, const float &by, const float &bz)
-{
-    float dx = bx - ax;
-    float dy = ay - by;
-    float dz = bz - az;
-
-    // 计算水平角h
-    float ah = std::atan2(dx, dz); // 参数顺序为Δx（东向分量）, Δz（南向分量）
-
-    // 计算俯仰角v
-    float horizontal_dist = std::sqrt(dx * dx + dz * dz);
-    float av = std::atan2(dy, horizontal_dist);
-    return {ah, av};
 }
 
 namespace Module
@@ -577,7 +630,6 @@ namespace Module
         {0x42, 0xC8},
         {0x0, 0x0},
         {-0x4, "F3 0F 11 45 FC D9 45 FC 8B E5 5D C3 D9 05 XX XX XX XX 8B E5 5D C3 D9 05 XX XX XX XX 8B E5 5D C3"}};
-
     Feature Feature::noClip = {
         {0x646B72},
         {0xE8, 0xFF, 0xFF, 0xFF, 0xFF, 0x90},
@@ -837,11 +889,12 @@ namespace Module
         Game::World::Entity entity;
         float distance;
         std::string name;
+        uint32_t range;
+        float anchorX, anchorY, anchorZ;
 
         // 添加一个构造函数
-        PrioritizedEntity(int p, Game::World::Entity e, float d, std::string n)
-            : priority(p), entity(e), distance(d), name(n) {}
-
+        PrioritizedEntity(int p, Game::World::Entity e, float d, std::string n, uint32_t r, float ax, float ay, float az)
+            : priority(p), entity(e), distance(d), name(n), range(r), anchorX(ax), anchorY(ay), anchorZ(az) {}
         // 自定义比较运算符，用于排序
         bool operator<(const PrioritizedEntity &other) const
         {
@@ -1039,7 +1092,7 @@ namespace Module
                      joinQuoted(noTargets).c_str());
             }
             // 使用构造函数创建 PrioritizedEntity 对象
-            result.push_back(PrioritizedEntity(priority, entity, distance, name));
+            result.push_back(PrioritizedEntity(priority, entity, distance, name, range, ax, ay, az));
         }
 
         // 排序
@@ -1063,10 +1116,12 @@ namespace Module
         float targetX, float targetY, float targetZ)
     {
         game.UpdateAddress().data.player.UpdateAddress();
-        float stop_eps = 1.0f;
-        uint32_t timeout_ms = 60000;
-        float speed = 50.f; // 固定速度（与老版 MoveEvent 保持一致）
-        uint32_t delay_ms = 20;
+
+        const float stop_eps = 1.0f;
+        const uint32_t timeout_ms = 60000;
+        const float speed = 50.f; // 固定速度（和旧 MoveEvent 一致）
+        const uint32_t delay_ms = 20;
+
         auto t0 = std::chrono::steady_clock::now();
         auto baseline_t = t0;
         float baseline_d = std::numeric_limits<float>::infinity();
@@ -1074,6 +1129,10 @@ namespace Module
 
         for (;;)
         {
+            Module::Anchor::Assert(game);
+            // --- 仅做最低高度保护：把目标Y钳到 minY（不判断 maxY） ---
+            const float safeTargetY = (targetY < minY ? minY : targetY);
+
             // 刷新坐标
             game.data.player.data.coord.UpdateAddress();
             float cx = game.data.player.data.coord.data.x.UpdateAddress().UpdateData().data;
@@ -1081,7 +1140,7 @@ namespace Module
             float cz = game.data.player.data.coord.data.z.UpdateAddress().UpdateData().data;
 
             // 到达判定
-            float dist = CalculateDistance(cx, cy, cz, targetX, targetY, targetZ);
+            float dist = CalculateDistance(cx, cy, cz, targetX, safeTargetY, targetZ);
             if (std::isnan(dist) || dist <= stop_eps)
             {
                 game.data.player.data.coord.data.xVel.UpdateAddress() = 0;
@@ -1092,10 +1151,10 @@ namespace Module
 
             // 正常推进：写速度 = 单位方向 * speed
             game.data.player.data.coord.data.xVel.UpdateAddress() = (targetX - cx) / dist * speed;
-            game.data.player.data.coord.data.yVel.UpdateAddress() = (targetY - cy) / dist * speed;
+            game.data.player.data.coord.data.yVel.UpdateAddress() = (safeTargetY - cy) / dist * speed;
             game.data.player.data.coord.data.zVel.UpdateAddress() = (targetZ - cz) / dist * speed;
 
-            // 卡住监测 + 小跳解卡（复用你原本窗口：10*delay/20*delay）
+            // 卡住监测 + 小跳解卡（复用你原本窗口：10*delay / 20*delay）
             auto now = std::chrono::steady_clock::now();
             auto dt = std::chrono::duration_cast<std::chrono::milliseconds>(now - baseline_t).count();
             if (dt >= (int)delay_ms * 20)
@@ -1108,8 +1167,8 @@ namespace Module
                 if (allow_tp && tpStep && std::abs(baseline_d - dist) < tpStep)
                 {
                     uint32_t tries = (std::abs(baseline_d - dist) < 1.0f) ? 10u : 1u;
-                    Tp2Target(game.pid, targetX, targetY, targetZ, delay_ms, tries);
-                    // 重置基线，下一窗再评估
+                    // 传送同样使用“安全Y”
+                    Tp2Target(game.pid, targetX, safeTargetY, targetZ, delay_ms, tries);
                     baseline_t = std::chrono::steady_clock::now();
                     baseline_d = std::numeric_limits<float>::infinity();
                 }
@@ -1139,9 +1198,8 @@ namespace Module
         const uint32_t &delay)                     // 循环延迟时间（毫秒）
     {
         // 扫图相关参数
-        static std::unordered_set<std::string> visitedPoints;
-        static bool hasGoal = false;
-        // static float targetX = 0.f, targetZ = 0.f;
+        std::unordered_set<std::string> visitedPoints;
+        bool hasGoal = false;
 
         MoveCtx mv{.safeDelay = delay ? delay : 1, .speed = speed, .pid = pid};
 
@@ -1193,7 +1251,11 @@ namespace Module
                 game.data.player.data.coord.data.zVel.UpdateAddress() = (targetZ - z) / dist * speed;
             }
         };
-
+        auto getKey = [](float x, float z)
+        {
+            return std::to_string(static_cast<int>(std::round(x))) + "|" +
+                   std::to_string(static_cast<int>(std::round(z)));
+        };
         while (functionRunMap[{pid, "FollowTarget"}].load())
         {
 
@@ -1208,11 +1270,46 @@ namespace Module
             }
 
             std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+
+            if (autoScanOn.load() && scanAll)
+            {
+                auto &players = game.data.world.UpdateAddress().UpdateData().data.players;
+                size_t count = players.size(); // 获取玩家数量
+                if (autoScanCount.load() <= players.size())
+                {
+                    LOGF("玩家数量 %zu ≤ 设定值 %u，跟随模式暂不启动", count, autoScanCount.load());
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+                    continue;
+                }
+            }
             // 更新游戏基址和玩家地址信息
             game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
+
             ax = game.data.player.data.coord.data.x.UpdateData().data;
             ay = game.data.player.data.coord.data.y.UpdateData().data;
             az = game.data.player.data.coord.data.z.UpdateData().data;
+
+            if (homeStop.load())
+            {
+                std::vector<std::string> __home_nr = {"placeable/sign/static/hub_building_landing_interactive", "placeable/sign/static/geodehub_location_craftercommons_interactive"};
+                std::vector<std::string> __tr = {};
+                std::vector<PrioritizedEntity> homeList = GetEntitysWithPriority(
+                    game,
+                    ax, ay, az,
+                    /*range=*/100,
+                    /*targetBoss=*/false,
+                    /*targetPlant=*/false,
+                    /*targetNormal=*/false,
+                    __home_nr, __tr,
+                    /*paramBossLevel=*/1);
+
+                if (!homeList.empty())
+                {
+                    LOGF("[回城暂停] 识别到回城点, 暂停一切操作. 直到脱离主城");
+                    std::this_thread::sleep_for(std::chrono::milliseconds(10000));
+                    continue;
+                }
+            }
 
             if (!players.empty())
             {
@@ -1237,7 +1334,7 @@ namespace Module
             std::vector<PrioritizedEntity> entitys = GetEntitysWithPriority(
                 game,
                 ax, ay, az,
-                realisticScanRange,
+                scanRange.load(),
                 targetBoss,
                 false,
                 false,
@@ -1271,12 +1368,6 @@ namespace Module
                             targetZ = currentZ;
                         }
 
-                        // 确保当前位置在 visitedPoints 中
-                        auto getKey = [](float x, float z)
-                        {
-                            return std::to_string(static_cast<int>(std::round(x))) + "|" +
-                                   std::to_string(static_cast<int>(std::round(z)));
-                        };
                         visitedPoints.insert(getKey(targetX, targetZ));
 
                         // 扫图逻辑
@@ -1284,19 +1375,6 @@ namespace Module
                         hasGoal = true;
                         LOGF("[初始启动扫描] => (%.0f, %.0f)", targetX, targetZ);
                     }
-                    // if (!hasGoal)
-                    // {
-                    //     game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
-                    //     targetX = game.data.player.data.coord.data.x.UpdateData().data;
-                    //     targetZ = game.data.player.data.coord.data.z.UpdateData().data;
-                    //     // 扫图逻辑
-                    //     GetNextPoint(
-                    //         targetX,
-                    //         targetZ,
-                    //         visitedPoints);
-                    //     hasGoal = true;
-                    //     LOGF("[初始启动扫描无名单开始移动] => (%.0f, %.0f)", targetX, targetZ); // 只在这里打
-                    // }
 
                     MoveEvent(targetX, targetY = std::clamp((std::max)(targetY, game.data.player.data.coord.data.y.UpdateData().data), minY, maxY), targetZ);
                     // 到达格心 → 再取下一格
@@ -1313,8 +1391,20 @@ namespace Module
             }
             else
             {
-                // 清理逻辑
-                KillEntitys(pid, entitys, game, mv, 500, "", e, targets, noTargets);
+                try
+                {
+                    Module::Anchor::Begin(
+                        ax, az,
+                        static_cast<float>(Module::scanRange.load() + Module::distanceEps.load()));
+
+                    // 清理逻辑
+                    KillEntitys(pid, entitys, game, mv, 500, "", e, targets, noTargets);
+                }
+                catch (const Module::Anchor::Break &)
+                {
+                    LOGW("[坐标骤变] 坐标发生急剧改变（被拉走/回城/世界变化），中断本轮清理并重新识别");
+                }
+                Module::Anchor::End();
             }
         }
     }
@@ -1336,7 +1426,6 @@ namespace Module
         return nearZero || zNearTwo;
     }
 
-    // 放在 namespace Module 里
     inline bool IsEmptyId(const std::string &s)
     {
         // 只要不含任何可打印字符(>32)就视为“空ID”
@@ -1357,6 +1446,21 @@ namespace Module
         std::vector<std::string> targets,
         std::vector<std::string> noTargets)
     {
+        // 依据名字是否命中 ButtonStarts 选择不同超时
+        auto isButtonStart = [&](const std::string &nm)
+        {
+            return std::any_of(
+                ButtonStarts.begin(), ButtonStarts.end(),
+                [&](const std::string &key)
+                {
+                    return !key.empty() && nm.find(key) != std::string::npos; // 子串命中即可
+                });
+        };
+        auto makeKey = [&](uintptr_t a, const std::string &nm, const std::string &tb) -> uint64_t
+        {
+            return (uint64_t)a ^ (std::hash<std::string>{}(tb) << 1) ^ (std::hash<std::string>{}(nm) << 2);
+        };
+
         int idx = 0;
         int total = static_cast<int>(entitys.size());
         static std::unordered_set<uintptr_t> printed;
@@ -1370,22 +1474,11 @@ namespace Module
         // 遍历entitys并输出日志
         for (auto &pe : entitys)
         {
-            ++idx;
-            // 依据名字是否命中 ButtonStarts 选择不同超时
-            auto isButtonStart = [&](const std::string &nm)
-            {
-                return std::any_of(
-                    ButtonStarts.begin(), ButtonStarts.end(),
-                    [&](const std::string &key)
-                    {
-                        return !key.empty() && nm.find(key) != std::string::npos; // 子串命中即可
-                    });
-            };
-            auto makeKey = [&](uintptr_t a, const std::string &nm, const std::string &tb) -> uint64_t
-            {
-                return (uint64_t)a ^ (std::hash<std::string>{}(tb) << 1) ^ (std::hash<std::string>{}(nm) << 2);
-            };
+            Module::Anchor::Begin(
+                pe.anchorX, pe.anchorZ,
+                static_cast<float>(pe.range + Module::distanceEps.load()));
 
+            ++idx;
             bool is_continue = false;
             Game::World::Entity entity = pe.entity;
             std::string name = entity.data.name.UpdateData(128).data; // 每次都取 string
@@ -1437,9 +1530,10 @@ namespace Module
                     //      entity.data.level.UpdateAddress().UpdateData().data,
                     //      ex, ey, ez);
                     printed.erase(pkey);
-                    // is_continue = true;
                     break; // 遇到空ID就跳过
                 }
+
+                Module::Anchor::Assert(game);
 
                 if (entity.data.isDeath.UpdateAddress().UpdateData().data == 0 || !EntityStillExists(game, entity))
                 {
@@ -1633,7 +1727,7 @@ namespace Module
                         std::vector<PrioritizedEntity> _entitys = GetEntitysWithPriority(
                             game,
                             ex, ey, ez,
-                            15,
+                            altarRange.load(),
                             true,
                             false,
                             true,
@@ -1642,6 +1736,10 @@ namespace Module
                             2);
                         if (!_entitys.empty())
                         {
+                            Module::Anchor::Begin(
+                                ex, ez,
+                                static_cast<float>(Module::altarRange.load() + Module::distanceEps.load()));
+
                             KillEntitys(pid, _entitys, game, ctx, 1, std::string(tab + " [[祭坛]") + name + "]", entity, targets, noTargets);
                         }
                     }
@@ -1666,9 +1764,9 @@ namespace Module
                         {
                             if (functionRunMap[{pid, "FollowTarget"}].load() == false)
                                 return;
-                            // MoveEvent(game, ctx, ex, ey + 1.5f, ez);
                             MoveUntilReached(game, ex, ey + 1.5f, ez);
                             std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                            entity.UpdateAddress().UpdateData();
                             game.UpdateAddress().data.player.UpdateAddress().data.coord.UpdateAddress().UpdateData();
                             float ax = game.data.player.data.coord.data.x.UpdateData().data;
                             float ay = game.data.player.data.coord.data.y.UpdateData().data;
@@ -1705,7 +1803,7 @@ namespace Module
                             std::vector<PrioritizedEntity> _entitys5 = GetEntitysWithPriority(
                                 game,
                                 ex, ey, ez,
-                                130,
+                                fiveStarRange.load(),
                                 /*targetBoss=*/true,
                                 /*targetPlant=*/false,
                                 /*targetNormal=*/false,
@@ -1724,6 +1822,10 @@ namespace Module
                                         break;
                                     }
                                 }
+
+                                Module::Anchor::Begin(
+                                    ex, ez,
+                                    static_cast<float>(Module::fiveStarRange.load() + Module::distanceEps.load()));
 
                                 KillEntitys(pid, _entitys5, game, ctx, 500,
                                             std::string(tab + " [[5*]") + name + "]",
@@ -1829,8 +1931,6 @@ namespace Module
         return nullptr;
     }
 
-    // ========================== REPLACE ENTIRE METHOD ==========================
-    // namespace Module { ... } scope
     // 修正：优先宝箱与通用分支的黑名单匹配都用 XZ 半径 8m；其它逻辑保持一致
     std::unique_ptr<Game::World::Entity> FindTarget(
         Game &game,
@@ -2038,6 +2138,7 @@ namespace Module
         visitedPoints.clear();
         visitedPoints.insert(getKey(x, z));
     }
+
 }
 
 void UpdateConfig(const char *key, const char *value)
@@ -2144,6 +2245,49 @@ void UpdateConfig(const char *key, const char *value)
         {
             Module::shortStallOn = false;
         }
+    }
+    else if (_key == "Module::autoScanOn")
+    {
+        // LOGF("Module::autoScanOn _value text: %s", _value[0].c_str());
+        if (_value[0] == "1")
+        {
+            Module::autoScanOn = true;
+        }
+        else if (_value[0] == "0")
+        {
+            Module::autoScanOn = false;
+        }
+    }
+    else if (_key == "Module::scanRange")
+    {
+        Module::scanRange = std::stoul(_value[0]);
+    }
+    else if (_key == "Module::altarRange")
+    {
+        Module::altarRange = std::stoul(_value[0]);
+    }
+    else if (_key == "Module::fiveStarRange")
+    {
+        Module::fiveStarRange = std::stoul(_value[0]);
+    }
+    else if (_key == "Module::distanceEps")
+    {
+        Module::distanceEps = std::stoul(_value[0]);
+    }
+    else if (_key == "Module::homeStop")
+    {
+        if (_value[0] == "1")
+        {
+            Module::homeStop = true;
+        }
+        else if (_value[0] == "0")
+        {
+            Module::homeStop = false;
+        }
+    }
+    else if (_key == "Module::autoScanCount")
+    {
+        Module::autoScanCount = std::stoul(_value[0]);
     }
     else if (_key == "Module::timeoutBlacklistMs")
     {
@@ -2278,10 +2422,17 @@ void FunctionOn(const Memory::DWORD pid, const char *funtion, const char *argv, 
         thread = new std::thread(Module::SetFeature, Module::Feature::noGravity, pid, std::stoul(_argv[0]));
     else if (std::strcmp(funtion, "SetUnlockZoomLimit") == 0)
         thread = new std::thread(Module::SetFeature, Module::Feature::unlockZoomLimit, pid, std::stoul(_argv[0]));
-    if (thread && waiting)
+    if (thread)
     {
-        thread->join();
-        Module::functionRunMap[{pid, funtion}].store(false);
+        if (waiting)
+        {
+            thread->join();
+            Module::functionRunMap[{pid, funtion}].store(false);
+        }
+        else
+        {
+            thread->detach();
+        }
     }
 }
 

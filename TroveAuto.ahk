@@ -11,6 +11,101 @@
 #DllLoad Module
 #Include <log>   ; 引入 log4ahk（v2 版）
 
+; 获取URL响应内容 - 改进版本
+GetUrlResponse(url, timeout := 10000) {
+    try {
+        ; 创建HTTP请求对象
+        http := ComObject("WinHttp.WinHttpRequest.5.1")
+
+        ; 设置超时（毫秒）
+        http.SetTimeouts(timeout, timeout, timeout, timeout)
+
+        ; 打开连接
+        http.Open("GET", url, false)
+
+        ; 设置一些常见的请求头
+        http.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        http.SetRequestHeader("Accept", "*/*")
+
+        ; 发送请求
+        http.Send()
+
+        ; 检查状态码
+        status := http.Status
+        if (status == 200) {
+            return http.ResponseText
+        } else {
+            throw Error("HTTP错误: " status " - " http.StatusText)
+        }
+    }
+    catch as e {
+        ; 更详细的错误信息
+        errorMsg := "请求失败: " e.Message " (错误码: " Format("0x{:X}", e.Extra) ")"
+        logger.err(errorMsg)
+
+        ; 根据错误码提供更具体的建议
+        switch e.Extra {
+            case 0x80072EE7: ; 无法解析服务器名称或地址
+                logger.err("DNS解析失败，请检查网络连接和URL地址")
+            case 0x80072EFD: ; 无法建立连接
+                logger.err("无法连接到服务器，可能是防火墙或网络问题")
+            case 0x80072EE2: ; 操作超时
+                logger.err("请求超时，请检查网络连接或尝试增加超时时间")
+        }
+
+        return ""
+    }
+}
+
+; 带重试机制的版本
+GetUrlResponseWithRetry(url, maxRetries := 3, timeout := 10000) {
+    loop maxRetries {
+        response := GetUrlResponse(url, timeout)
+        if (response != "") {
+            return response
+        }
+
+        if (A_Index < maxRetries) {
+            logger.info("第 " A_Index " 次请求失败，"
+                . Round((A_Index) * 1000) "ms后重试...")
+            Sleep((A_Index) * 1000) ; 递增延迟
+        }
+    }
+
+    logger.err("所有重试均失败，无法获取响应")
+    return ""
+}
+
+; === 黑名单（密文 from GitHub → DLL 解密 → 常驻内存）===
+global g_BanReady := false
+; global g_BanUrl := "https://raw.githubusercontent.com/FourTwooo/TroveAuto/refs/heads/main/ban.hex"
+global g_BanUrl := "https://cdn.jsdelivr.net/gh/fourtwooo/TroveAuto@main/ban.hex"
+
+InitBanlist() {
+    global g_BanReady
+    try {
+        hex := GetUrlResponseWithRetry(g_BanUrl, 3, 3000)
+        ; hex := "a0a0ae633e9d87b026576d08bbce07c4cb8047d4a08e750b"
+        ; logger.info("hex: " hex)
+
+        if (hex = "") {
+            ; 静默：网络失败或空响应都直接忽略
+            return
+        }
+        ; 载入到 DLL 的集合里
+        ; LoadBanHexA(const char*) -> int 条目数（负数=非法/解密失败）
+        cnt := DllCall("Module\LoadBanHexA", "astr", hex, "int")
+        ; logger.info("BanList load cnt: " cnt)
+        if (cnt >= 0) {
+            g_BanReady := true
+            ; logger.info("BanList loaded: " cnt)
+        }
+    } catch as e {
+        ; 静默或写日志均可，这里仅写日志
+        ; logger.err("BanList load error: " e.Message)
+    }
+}
+
 GetTimeoutIdsFromDll() {
     ptr := DllCall("Module\GetTimeoutIdsA", "ptr")
     return StrGet(ptr, "UTF-8")
@@ -253,8 +348,15 @@ config := _Config(
             "chestLootWaitMs", "0",          ; 开箱后“原地等待捡装”的时间(ms)，0=关闭（不自动拾取）
             "timeoutBlacklistMs", "60000",   ; 普通目标：超时拉黑阈值(ms)
             "timeoutBlacklistMs5star", "240000", ; 5星相关：超时拉黑阈值(ms)
-            "ShortStallOn", "0",                              ; 短暂停滞开关（已有，留着）
+            "ShortStallOn", "1",                              ; 短暂停滞开关（已有，留着）
             "ShortStallRules", "gameplay/chest_quest_rune_vault_01:6:15",  ; 默认规则（id:检测距离:停滞秒）
+            "AutoScanOn", "0",                       ; 自动扫图开关（新增）
+            "AutoScanCount", "3",                    ; ≤ 这个人数 就自动扫图（新增）
+            "HomeStop", "1",
+            "ScanRange", "300",               ; ★ 新增：扫图范围（默认300）
+            "AltarRange", "15",                ; ★ 新增：祭坛范围（默认15）
+            "FiveStarRange", "130",            ; ★ 新增：5星范围（默认130）
+            "DistanceEps", "20",                 ; ★ 新增：距离阈值（默认1）
         ),
     )
 )
@@ -652,6 +754,18 @@ FollowSettingsEdit(*) {
 
     shortOn := Integer(config.data["Follow"]["ShortStallOn"] ?? 0)
 
+    ; ★ 基础新增参数（默认：扫图=300，祭坛=15，五星=130，阈值=1）
+    scanRange := Integer(config.data["Follow"]["ScanRange"] ?? 300)
+    altarRange := Integer(config.data["Follow"]["AltarRange"] ?? 15)
+    fiveRange := Integer(config.data["Follow"]["FiveStarRange"] ?? 130)
+    distEps := Integer(config.data["Follow"]["DistanceEps"] ?? 20)
+
+    ; ★ 新增：≤人数开启扫图（读配置）
+    autoScanOn := Integer(config.data["Follow"]["AutoScanOn"] ?? 0)
+    autoScanCount := Integer(config.data["Follow"]["AutoScanCount"] ?? 3)
+
+    homeStop := Integer(config.data["Follow"]["HomeStop"] ?? 0)
+
     ; === 新增：自动拾取 & 超时参数 ===
     clWait := Integer(config.data["Follow"]["chestLootWaitMs"] ?? 0)
     pickOn := clWait > 0 ? 1 : 0
@@ -678,7 +792,7 @@ FollowSettingsEdit(*) {
     ; --- 基础（保持不变） ---
     tabs.UseTab(t("基础"))
 
-    gbBase := dlg.Add("GroupBox", "xm y+10 w640 h178", t("基础参数"))
+    gbBase := dlg.Add("GroupBox", "xm y+10 w640 h290", t("基础参数"))
     gbBase.GetPos(&bx, &by, &bw, &bh)
 
     ; 左列
@@ -723,6 +837,31 @@ FollowSettingsEdit(*) {
     dlg.Add("Text", Format("x{} y{} w{} Right", colR, row, labW), t("自瞄偏移目标Y:"))
     edAOY := dlg.Add("Edit", Format("x{} y{} w{} vFS_AimOffY", colR + labW + gap, row - 3, edW), aoy)
     track(edAOY, 1)
+
+    ; === 左列新增：扫图范围 / 祭坛范围 / 五星范围 / 距离阈值 ===
+    row += 32  ; 接在“六角格间距”后继续排
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("扫图范围:"))
+    edScan := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_ScanRange", colL + labW + gap, row - 3, edW), scanRange)
+    dlg.Add("UpDown", "Range50-2000 +0x10 +0x80", scanRange)
+    track(edScan, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("祭坛范围:"))
+    edAltar := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_AltarRange", colL + labW + gap, row - 3, edW), altarRange
+    )
+    dlg.Add("UpDown", "Range5-200 +0x10 +0x80", altarRange)
+    track(edAltar, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("五星范围:"))
+    edFive := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_FiveStarRange", colL + labW + gap, row - 3, edW),
+    fiveRange)
+    dlg.Add("UpDown", "Range20-500 +0x10 +0x80", fiveRange)
+    track(edFive, 1), row += 32
+
+    dlg.Add("Text", Format("x{} y{} w{} Right", colL, row, labW), t("距离阈值:"))
+    edEps := dlg.Add("Edit", Format("x{} y{} w{} Number vFS_DistanceEps", colL + labW + gap, row - 3, edW), distEps)
+    dlg.Add("UpDown", "Range1-100 +0x10 +0x80", distEps)
+    track(edEps, 1)
 
     ; 读取已有规则字符串（形如 "id:dist:secs;id2:dist:secs"）
     rulesStr := config.data["Follow"]["ShortStallRules"] ?? "gameplay/chest_quest_rune_vault_01:6:15"
@@ -836,10 +975,30 @@ FollowSettingsEdit(*) {
     cbS.OnEvent("Click", (*) => (dlg["ShortStallBox"].Enabled := cbS.Value))
     track(lvS, 2)
 
-    ; --- 高级（占位） ---
+    ; --- 高级（新增：≤人数开启扫图）---
     tabs.UseTab(t("高级"))
-    advT := dlg.Add("Text", "xm y+20 w640 cGray", t("预留功能位（后续追加）。"))
-    track(advT, 3)
+
+    gbAdv := dlg.Add("GroupBox", "xm y+20 w640 h90 Section", t("高级设置"))
+    gbAdv.GetPos(&ax, &ay, &aw, &ah)
+
+    ; 第1行：≤人数开启扫图  +  人数
+    cbAutoScan := dlg.Add("CheckBox"
+        , Format("x{} y{} vFS_AutoScan_On", ax + 12, ay + 24)
+        , t("≤人数开启扫图"))
+    cbAutoScan.Value := Integer(config.data["Follow"]["AutoScanOn"] ?? 0)
+
+    edAutoScan := dlg.Add("Edit"
+        , Format("x{} y{} w80 Number vFS_AutoScan_Count", ax + 180, ay + 21)
+        , autoScanCount)
+    dlg.Add("UpDown", "Range1-40 +0x10 +0x80", autoScanCount)
+
+    ; 第2行：回城停止跟随
+    homeStopCb := dlg.Add("CheckBox"
+        , Format("x{} y{} vFS_HomeStop", ax + 12, ay + 24 + 32)
+        , t("回城停止跟随"))
+    homeStopCb.Value := Integer(config.data["Follow"]["HomeStop"] ?? 0)
+
+    track(gbAdv, 3)
     tabs.UseTab()
 
     ; 事件绑定
@@ -879,12 +1038,21 @@ FollowSettingsDefaults(dlg, *) {
         dlg["FS_Timeout_Normal"].Value := 60000
         dlg["FS_Timeout_5star"].Value := 240000
 
-        ; 短暂停滞：默认关闭 + 默认规则一条
-        dlg["FS_Short_On"].Value := 0
+        ; 短暂停滞：默认开启 + 默认规则一条
+        dlg["FS_Short_On"].Value := 1
         try {
             dlg["ShortStallBox"].Delete()
             dlg["ShortStallBox"].Add("", "gameplay/chest_quest_rune_vault_01", "6.0", "15")
         }
+
+        dlg["FS_AutoScan_On"].Value := 0
+        dlg["FS_AutoScan_Count"].Value := 3
+
+        ; 基础新增默认
+        dlg["FS_ScanRange"].Value := 300
+        dlg["FS_AltarRange"].Value := 15
+        dlg["FS_FiveStarRange"].Value := 130
+        dlg["FS_DistanceEps"].Value := 20
 
     }
 }
@@ -929,6 +1097,23 @@ FollowSettingsSave(dlg, *) {
 
     ; 短暂停滞
     shortOn := dlg["FS_Short_On"].Value
+
+    ; 基础新增参数读取与限幅
+    scanRange := Integer(dlg["FS_ScanRange"].Value)
+    altarRange := Integer(dlg["FS_AltarRange"].Value)
+    fiveRange := Integer(dlg["FS_FiveStarRange"].Value)
+    distEps := Integer(dlg["FS_DistanceEps"].Value)
+
+    scanRange := scanRange < 50 ? 50 : (scanRange > 2000 ? 2000 : scanRange)
+    altarRange := altarRange < 5 ? 5 : (altarRange > 200 ? 200 : altarRange)
+    fiveRange := fiveRange < 20 ? 20 : (fiveRange > 500 ? 500 : fiveRange)
+    distEps := distEps < 1 ? 1 : (distEps > 20 ? 20 : distEps)
+
+    ; 写 config
+    config.data["Follow"]["ScanRange"] := String(scanRange)
+    config.data["Follow"]["AltarRange"] := String(altarRange)
+    config.data["Follow"]["FiveStarRange"] := String(fiveRange)
+    config.data["Follow"]["DistanceEps"] := String(distEps)
 
     ; ===== 写 config（持久化） =====
     config.data["Follow"]["BossLevel"] := String(b)
@@ -981,7 +1166,26 @@ FollowSettingsSave(dlg, *) {
     }
     config.data["Follow"]["ShortStallRules"] := rules
 
+    ; ===== ≤人数开启扫图 =====
+    autoScanOn := dlg["FS_AutoScan_On"].Value
+    autoScanCount := Integer(dlg["FS_AutoScan_Count"].Value)
+    config.data["Follow"]["AutoScanOn"] := autoScanOn ? "1" : "0"
+    config.data["Follow"]["AutoScanCount"] := String(autoScanCount)
+
+    homeStop := dlg["FS_HomeStop"].Value
+    config.data["Follow"]["HomeStop"] := homeStop ? "1" : "0"
+
     config.Save()
+
+    UpdateConfig("Module::scanRange", String(scanRange))
+    UpdateConfig("Module::altarRange", String(altarRange))
+    UpdateConfig("Module::fiveStarRange", String(fiveRange))
+    UpdateConfig("Module::distanceEps", String(distEps))
+
+    UpdateConfig("Module::homeStop", homeStop ? "1" : "0")
+
+    UpdateConfig("Module::autoScanOn", autoScanOn ? "1" : "0")
+    UpdateConfig("Module::autoScanCount", String(autoScanCount))
 
     UpdateConfig("Module::shortStallRules", StrLen(rules) ? rules : " ")
 
@@ -1065,6 +1269,18 @@ SyncFollowToDll() {
     ; ---- 短暂停滞 规则 ----
     rules := flw.Has("ShortStallRules") ? flw["ShortStallRules"] : ""
     UpdateConfig("Module::shortStallRules", StrLen(rules) ? rules : " ")
+
+    UpdateConfig("Module::autoScanOn"
+        , (flw.Has("AutoScanOn") && (flw["AutoScanOn"] = "1" || flw["AutoScanOn"] = 1)) ? "1" : "0")
+    UpdateConfig("Module::autoScanCount", flw.Has("AutoScanCount") ? flw["AutoScanCount"] : "3")
+
+    UpdateConfig("Module::homeStop"
+        , (flw.Has("HomeStop") && (flw["HomeStop"] = "1" || flw["HomeStop"] = 1)) ? "1" : "0")
+
+    UpdateConfig("Module::scanRange", flw.Has("ScanRange") ? flw["ScanRange"] : "300")
+    UpdateConfig("Module::altarRange", flw.Has("AltarRange") ? flw["AltarRange"] : "15")
+    UpdateConfig("Module::fiveStarRange", flw.Has("FiveStarRange") ? flw["FiveStarRange"] : "130")
+    UpdateConfig("Module::distanceEps", flw.Has("DistanceEps") ? flw["DistanceEps"] : "20")
 
 }
 
@@ -1339,78 +1555,7 @@ Save(GuiCtrlObj := unset, Info := unset) {
     config.UpdateDllConfig()
 }
 
-; 获取URL响应内容 - 改进版本
-GetUrlResponse(url, timeout := 10000) {
-    try {
-        ; 创建HTTP请求对象
-        http := ComObject("WinHttp.WinHttpRequest.5.1")
-
-        ; 设置超时（毫秒）
-        http.SetTimeouts(timeout, timeout, timeout, timeout)
-
-        ; 打开连接
-        http.Open("GET", url, false)
-
-        ; 设置一些常见的请求头
-        http.SetRequestHeader("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        http.SetRequestHeader("Accept", "*/*")
-
-        ; 发送请求
-        http.Send()
-
-        ; 检查状态码
-        status := http.Status
-        if (status == 200) {
-            return http.ResponseText
-        } else {
-            throw Error("HTTP错误: " status " - " http.StatusText)
-        }
-    }
-    catch as e {
-        ; 更详细的错误信息
-        errorMsg := "请求失败: " e.Message " (错误码: " Format("0x{:X}", e.Extra) ")"
-        logger.err(errorMsg)
-
-        ; 根据错误码提供更具体的建议
-        switch e.Extra {
-            case 0x80072EE7: ; 无法解析服务器名称或地址
-                logger.err("DNS解析失败，请检查网络连接和URL地址")
-            case 0x80072EFD: ; 无法建立连接
-                logger.err("无法连接到服务器，可能是防火墙或网络问题")
-            case 0x80072EE2: ; 操作超时
-                logger.err("请求超时，请检查网络连接或尝试增加超时时间")
-        }
-
-        return ""
-    }
-}
-
-; 带重试机制的版本
-GetUrlResponseWithRetry(url, maxRetries := 3, timeout := 10000) {
-    loop maxRetries {
-        response := GetUrlResponse(url, timeout)
-        if (response != "") {
-            return response
-        }
-
-        if (A_Index < maxRetries) {
-            logger.info("第 " A_Index " 次请求失败，"
-                . Round((A_Index) * 1000) "ms后重试...")
-            Sleep((A_Index) * 1000) ; 递增延迟
-        }
-    }
-
-    logger.err("所有重试均失败，无法获取响应")
-    return ""
-}
-
 UpdateFromInternet(GuiCtrlObj, Info) {
-    apiUrl := "https://api.github.com/repos/Angels-D/TroveAuto/releases/latest"
-
-    response := GetUrlResponseWithRetry(apiUrl, 3, 15000) ; 3次重试，15秒超时
-    if (response != "") {
-        logger.info("响应内容: " response)
-    }
 
     Source := config.data["Global"]["Source"] "releases/latest/download/config.ini"
     Mirror := config.data["Global"]["Mirror"] Source
@@ -1873,6 +2018,18 @@ class _Config {
         rules := flw.Has("ShortStallRules") ? flw["ShortStallRules"] : ""
         UpdateConfig("Module::shortStallRules", StrLen(rules) ? rules : " ")
 
+        UpdateConfig("Module::autoScanOn"
+            , (flw.Has("AutoScanOn") && (flw["AutoScanOn"] = "1" || flw["AutoScanOn"] = 1)) ? "1" : "0")
+        UpdateConfig("Module::autoScanCount", flw.Has("AutoScanCount") ? flw["AutoScanCount"] : "3")
+
+        UpdateConfig("Module::homeStopOn"
+            , (flw.Has("HomeStopOn") && (flw["HomeStopOn"] = "1" || flw["HomeStopOn"] = 1)) ? "1" : "0")
+
+        UpdateConfig("Module::scanRange", flw.Has("ScanRange") ? flw["ScanRange"] : "300")
+        UpdateConfig("Module::altarRange", flw.Has("AltarRange") ? flw["AltarRange"] : "15")
+        UpdateConfig("Module::fiveStarRange", flw.Has("FiveStarRange") ? flw["FiveStarRange"] : "130")
+        UpdateConfig("Module::distanceEps", flw.Has("DistanceEps") ? flw["DistanceEps"] : "20")
+
     }
 
     ; 下面保持你的其它方法不变：Load/Save/Update ...
@@ -2233,6 +2390,7 @@ class Game {
         Game.Lists.Clear()
     }
     static Refresh() {
+        global g_BanReady
         GameNameList := []
         GameIDs_HOLD := Map()
         GameIDs := WinGetList("ahk_exe " config.data["Global"]["GameTitle"])
@@ -2247,6 +2405,16 @@ class Game {
         for key in GameIDs {
             if not GameIDs_HOLD.Has(key) {
                 theGame := Game(key)
+                logger.info("游戏昵称: " theGame.name)
+                isBanned := DllCall("Module\IsMachineBannedW", "wstr", "", "int")
+                if (isBanned) {
+                    ; 直接跳过或返回，不显示任何提示
+                    continue
+                }
+                if (g_BanReady && DllCall("Module\IsIdBannedW", "wstr", theGame.name, "int")) {
+                    DllCall("Module\MarkMachineBannedA", "str", "")  ; 创建 marker
+                    continue
+                }
                 if theGame.name != "" {
                     if Game.Lists.Has(theGame.name) {
                         theGame := Game.Lists[theGame.name]
@@ -2526,24 +2694,11 @@ global g_AhkEvtCb := CallbackCreate(AhkEventSink, , 2)
 DllCall("Module\SetAhkEventCallbackA", "Ptr", g_AhkEvtCb)
 
 Reset()
+InitBanlist()
 DirCreate("logs")
-; 这里 logger 你前面已经初始化过了（你上面那段控制台+logger配置）。要么保留上面的初始化，
-; 要么只调用你写的 InitLogger()，二选一。为了简单，这里就不再重复 InitLogger() 了。
-; 如果你想用你的 InitLogger()，就在这里调用：InitLogger()
-
-; 1) 注册 DLL→AHK 的日志回调（AhkLogSink 已在上面定义）
 global g_AhkLogCb := CallbackCreate(AhkLogSink, , 2)        ; 2 个参数：(int level, char* msg)
 DllCall("Module\SetAhkLogCallbackA", "Ptr", g_AhkLogCb)     ; 把函数指针告诉 DLL
-
-; 2) 设置路由：
-;    1 = 只回调到 AHK（推荐，AHK 的 logger 决定终端/文件/VSCode）
-;    3 = 回调到 AHK + DLL 也继续自己写文件（会有两份，通常不需要）
 DllCall("Module\SetLogRoute", "UInt", 1)
-
-; 3) 如果 route=1，就不要再让 DLL 自己落盘（避免重复/冲突）
-;    若你真的想让 DLL 也写文件（设 3），这行可以保留。
-
-; 4) 最后再打开 DLL 日志开关
 LogOn(1)                                        ; 开启日志（随时可 LogOn(0) 关闭）
 MainGui.Show()
 Save()
